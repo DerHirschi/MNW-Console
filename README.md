@@ -1,4 +1,4 @@
-# MNW Ship Probe
+# MNW Console / API
 
 External data probe + control console for **Modern Naval Warfare**. Runs inside
 the game (piggybacked onto existing element scripts), reads **all** own-ship
