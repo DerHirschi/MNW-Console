@@ -37,7 +37,7 @@ No build system, no linting config. Python 3 only.
 
 The game embeds Python for .NET. Two distinct API levels:
 
-- **Level 1 = mission scripting** (`_P.*`, `_T.*`, `_Z.*`): runs once at mission load. NO tick hooks, NO runtime reads of ship state, `_mission_started` is built-in. Documented in `/home/masto/MNW-Mission-Builder/AGENTS.md`.
+- **Level 1 = mission scripting** (`_P.*`, `_T.*`, `_Z.*`): runs once at mission load. NO tick hooks, NO runtime reads of ship state, `_mission_started` is built-in.
 - **Level 2 = runtime AI API**: element scripts get `_start_()`, `_random_tick_()`, `_tick_()`, `_stop_()` hooks and injected singletons (host globals like `IActCommon`, `IPrepCommon`, `ActCommon`, `PrepCommon`, `ScenarioManager`, `GeoCoord`/`GeoCord`, `Waypoint`, `ElementTools`, `ContactTools`, `MathTools`, `NavTools`, `MechTools`, `ClockManager`, `CoordinatesManager`, `Navigation`, `SteeringDiving`, `Integrity`, `AmmunitionStorage`, `Maneuvering`, `Coxswain`, `FireControl`, `TowedController`, `MastsController`, `DepthGauge`, `OpticalSystem`, `ActiveSonar`, `PassiveSonar`, `UnityScriptComponent`).
 
 ### Runtime READ (all verified against `General_Behaviour_logic*` sources)
