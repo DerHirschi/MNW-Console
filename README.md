@@ -144,7 +144,7 @@ python3 console.py --log-dir <dir> watch 2
 | `sonctl auto on\|off` | Enable/disable auto-tracking of new contacts |
 | `sonctl ids` | List tracked contact IDs (via GetContactIDs) |
 | `sonctl data ID` | Show tracker data for contact (bearing, range, sensor via GetTrackerData) |
-| `sonctl mark ID BEARING` | Manually mark a contact bearing |
+| `sonctl mark ID BEARING` | Manually mark a contact bearing (ManualMark with current DateTime) |
 | `sonctl track ID` | Track a contact (overload — currently broken, use auto on instead) |
 | `sonctl untrack GUID TYPE` | Untrack a contact |
 | `sonctl diag` | Diagnostic: dump all SonarSystem fields + CachedContacts with dir() |
@@ -153,9 +153,26 @@ python3 console.py --log-dir <dir> watch 2
 
 | Command | Description |
 |---------|-------------|
-| `tracker [TYPE]` | Show FireControl TrackerManagers + contacts. Types: `visual`, `radar`, `esm`, `radio`, `weapon`, `ais`, `active`, `manual` |
+| `tracker [TYPE]` | Show FireControl TrackerManagers + contacts (prefix-matched) + Sonar tracker row. Types: `visual`, `radar`, `esm`, `radio`, `weapon`, `ais`, `active`, `manual` (or numbers `0`-`7`), plus `sonar` |
+| `tracker TYPE ID` | Probe all TrackerManager getters for a track id (GetBearing/GetRange/GetSpeed/GetCourse/GetCPA/GetContactID/GetTimestamp/GetBC/GetCoordinates...) |
+| `tracker TYPE clear` | Clear tracks (`Clear()` → falls back to `Clear(0)`) |
+| `tracker TYPE clearid ID` | Remove one track (`ClearID`) |
+| `tracker TYPE loadsnap STR` | `LoadSnapshot` test (1-arg + 2-arg attempt) |
+| `tracker TYPE tkdump ID` | Dump all fields of `GetTrack(cid)` → `mnw.Systems.ContactData` (16 fields: `_Bearing/_BearingRate/_Range/_Speed/_Course/_Coordinates/_Category/_StandardIdentity/_Timestamp/...`) |
+| `tracker new TYPE ID` | Manually create a track via `TrackerManager.New(int, int)` (empty hull) |
+| `tracker raw` | Raw ContactManager diagnostics: all GetUsed IDs + `GetPrefix` values (shows which sensor owns each track) |
 | `radar` | Shortcut for `tracker radar` |
 | `esm` | Shortcut for `tracker esm` |
+
+**Tracker notes (live-verified):**
+- `GetUsed()` returns only **assigned** tracks — contacts in sensor range without
+  a UI track assignment do not appear. `tracker raw` shows the real prefix per id.
+- Track IDs are local per TrackerManager; `GetContactID(trackId)` returns the
+  global ContactManager ID (e.g. radar track 0 → contact 3/4/5). IDs are handed
+  out globally across sensors (sonar 0-3, then esm 4-7, then radar 8+...).
+- The `Sonar` prefix has no FireControl TrackerManager — those contacts belong
+  to the SonarSystem tracker (see `sonctl`), but `tracker sonar` lists them via
+  the ContactManager.
 
 ### AI & Combat
 
@@ -225,6 +242,8 @@ python3 console.py --log-dir <dir> watch 2
 - **Accessing `.Overloads` on C# methods freezes the game.** Never use
   reflection introspection on overloaded methods from the probe.
 - **`m.Player` freezes the Unity main thread.** Use `CoordinatesManager.Player`.
+- **Too many native C# calls in series freeze the game** (e.g. 9× ManualMark,
+  4× LoadSnapshot attempts). Keep command probes to ≤2 C# calls per command.
 
 ## Tests
 
