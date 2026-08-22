@@ -54,13 +54,21 @@ _DEFAULTS = {
     "allow_commands": ["helm", "planes", "sd-dump", "tanks", "env", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc"],
     "resolve_positions": False,
     "state_every": 3,
+    "read_identity": True,
+    "read_navigation": True,
+    "read_blackboard": True,
+    "read_systems": True,
+    "collect_systems_components": False,
+    "read_steering": True,
     "read_contacts": True,
     "read_sonar": True,
-    "read_sonar_arrays": False,
-    "max_sonar_arrays": 8,
+    "read_sonar_arrays": True,
+    "max_sonar_arrays": 4,
     "max_sonar_contacts": 20,
     "read_ai": True,
     "max_ai_elements": 30,
+    "read_mission": True,
+    "read_clock": True,
     "measure_perf": False,
 }
 
@@ -771,7 +779,7 @@ class _Probe(object):
         tmp = path + ".tmp"
         try:
             with io.open(tmp, "w", encoding="utf-8") as f:
-                json.dump(obj, f, indent=2, default=_json_default)
+                json.dump(obj, f, default=_json_default)
             if os.path.isfile(path):
                 os.remove(path)
             os.rename(tmp, path)
@@ -1089,6 +1097,8 @@ class _Probe(object):
                         out["%s_level" % pref] = _safe_num(r2[1], 4)
                     r2 = _try(lambda tank=tank: list(tank.Components))
                     if r2[0] != "ok" or not r2[1]:
+                        continue
+                    if not self.cfg.get("collect_systems_components", False):
                         continue
                     counts = {"ok": 0, "malf": 0, "dmg": 0, "other": 0}
                     damaged = []
@@ -2348,74 +2358,78 @@ class _Probe(object):
             self.player_state = None
             return None
         st = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "player": det}
-        if pinfo is not None:
-            st["identity"] = self.read_identity(pinfo)
-        elif self.host is not None:
-            info = self.host_get("_Information")
-            if info is not None:
-                st["identity"] = self.read_identity(info)
-        self.emit("cp: identity done")
+        if self.cfg.get("read_identity", True):
+            if pinfo is not None:
+                st["identity"] = self.read_identity(pinfo)
+            elif self.host is not None:
+                info = self.host_get("_Information")
+                if info is not None:
+                    st["identity"] = self.read_identity(info)
+        else:
+            st["identity"] = {"disabled": True}
         if self.cfg.get("measure_perf"):
             perf["identity"] = round(time.time() - t0, 6)
-        st["navigation"] = self.read_navigation()
-        self.emit("cp: navigation done")
+        if self.cfg.get("read_navigation", True):
+            st["navigation"] = self.read_navigation()
+        else:
+            st["navigation"] = {"disabled": True}
         if self.cfg.get("measure_perf"):
             perf["navigation"] = round(time.time() - t0, 6)
-        st["blackboard"] = self.read_blackboard()
-        self.emit("cp: blackboard done")
+        if self.cfg.get("read_blackboard", True):
+            st["blackboard"] = self.read_blackboard()
+        else:
+            st["blackboard"] = {"disabled": True}
         if self.cfg.get("measure_perf"):
             perf["blackboard"] = round(time.time() - t0, 6)
-        st["systems"] = self.read_systems()
-        self.emit("cp: systems done")
+        if self.cfg.get("read_systems", True):
+            st["systems"] = self.read_systems()
+        else:
+            st["systems"] = {"disabled": True}
         if self.cfg.get("measure_perf"):
             perf["systems"] = round(time.time() - t0, 6)
         if self.cfg.get("read_steering", True):
             st["steering"] = self.read_steering()
-            self.emit("cp: steering done")
         else:
             st["steering"] = {"disabled": True}
-            self.emit("cp: steering done (disabled)")
         if self.cfg.get("read_contacts", True):
             st["contacts"] = self.read_contacts()
         else:
             st["contacts"] = {"count": 0, "disabled": True}
-        self.emit("cp: contacts done")
         if self.cfg.get("measure_perf"):
             perf["contacts"] = round(time.time() - t0, 6)
         if self.cfg.get("read_sonar", True):
             st["sonar"] = self.read_sonar()
-            self.emit("cp: sonar done")
         else:
             st["sonar"] = {"disabled": True}
-            self.emit("cp: sonar done (disabled)")
         if self.cfg.get("read_sonar_arrays", False):
             st["sonar_arrays"] = self.read_sonar_arrays()
-            self.emit("cp: sonar arrays done")
         if self.cfg.get("measure_perf"):
             perf["sonar"] = round(time.time() - t0, 6)
         if self.cfg.get("read_ai", True):
             self.read_ai_elements()
-            self.emit("cp: ai done")
-        else:
-            self.emit("cp: ai done (disabled)")
         if self.cfg.get("measure_perf"):
             perf["ai"] = round(time.time() - t0, 6)
-        st["mission"] = self.read_mission()
-        self.emit("cp: mission done")
-        st["clock"] = {}
-        try:
-            cmgr = self.clock_manager()
-            if cmgr is None:
-                st["clock"]["err"] = "no clock manager"
-            else:
-                t = _try(lambda: str(cmgr.Time))
-                if t[0] == "ok":
-                    st["clock"]["time"] = t[1]
-                ts = _try(lambda: float(cmgr.TimeScale))
-                if ts[0] == "ok":
-                    st["clock"]["scale"] = ts[1]
-        except Exception as e:
-            st["clock"]["err"] = _desc(e, 100)
+        if self.cfg.get("read_mission", True):
+            st["mission"] = self.read_mission()
+        else:
+            st["mission"] = {"disabled": True}
+        if self.cfg.get("read_clock", True):
+            st["clock"] = {}
+            try:
+                cmgr = self.clock_manager()
+                if cmgr is None:
+                    st["clock"]["err"] = "no clock manager"
+                else:
+                    t = _try(lambda: str(cmgr.Time))
+                    if t[0] == "ok":
+                        st["clock"]["time"] = t[1]
+                    ts = _try(lambda: float(cmgr.TimeScale))
+                    if ts[0] == "ok":
+                        st["clock"]["scale"] = ts[1]
+            except Exception as e:
+                st["clock"]["err"] = _desc(e, 100)
+        else:
+            st["clock"] = {"disabled": True}
         self.player_state = st
         if self.cfg.get("measure_perf"):
             st["perf"] = perf
@@ -6196,8 +6210,14 @@ class _Probe(object):
         # tick_delay cycles do a full C# collect (state_every=1 == old
         # behavior). Between full collects we only dispatch orders (cheap file
         # reads) so the probe does not stall the Unity host every cycle.
-        state_every = max(1, int(self.cfg.get("state_every", 1)))
-        if self.tick_count % state_every == 0:
+        # NOTE: _acted_count (not tick_count) is used because tick_count is the
+        # RAW random-tick counter and collect_state() is only reached after the
+        # tick_delay guard — so tick_count is always a multiple of tick_delay
+        # here. Using tick_count % state_every would be a no-op when
+        # state_every divides tick_delay (e.g. 30 % 3 == 0 always true).
+        self._acted_count = getattr(self, "_acted_count", -1) + 1
+        state_every = max(1, int(self.cfg.get("state_every", 3)))
+        if self._acted_count % state_every == 0:
             try:
                 self.collect_state()
             except Exception as e:

@@ -34,11 +34,20 @@
   ],
   "resolve_positions": false,
   "state_every": 3,
+  "read_identity": true,
+  "read_navigation": true,
+  "read_blackboard": true,
+  "read_systems": true,
+  "collect_systems_components": false,
+  "read_steering": true,
   "read_contacts": true,
   "read_sonar": true,
-  "read_sonar_arrays": false,
-  "max_sonar_arrays": 8,
+  "read_sonar_arrays": true,
+  "max_sonar_arrays": 4,
   "max_sonar_contacts": 20,
   "read_ai": true,
-  "max_ai_elements": 30
+  "max_ai_elements": 30,
+  "read_mission": true,
+  "read_clock": true,
+  "measure_perf": false
 }

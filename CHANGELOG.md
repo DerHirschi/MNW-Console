@@ -1,5 +1,45 @@
 # Changelog
 
+## v2.1 (2026-08-22) — Config toggles + state_every fix
+
+Full sync with `masto/MNW-Tool/ship-probe/`. New per-section config flags,
+state_every bug fix, reduced checkpoint noise.
+
+### ship_probe.py
+
+- **Per-section config toggles** — `read_identity`, `read_navigation`,
+  `read_blackboard`, `read_systems`, `read_steering`, `read_mission`,
+  `read_clock` added to `_DEFAULTS`. Each `read_*()` section gated by its
+  flag; disabled sections return `{"disabled": true}`.
+- **`collect_systems_components`** (default false) — gates the expensive
+  Components loop in `read_systems()` (~30-50 C# calls per tank).
+- **`state_every` bug fix** — was checking `tick_count % state_every` against
+  the raw random-tick counter, which is always a multiple of `tick_delay`.
+  When `state_every` divides `tick_delay` (e.g. 30%3==0), the condition was
+  always true → `state_every` had zero effect. Now uses a separate
+  `_acted_count` counter. Reduces collect_state() calls by ~67%.
+- **Compact JSON output** — `indent=2` removed from `_atomic_write` for
+  smaller state files.
+- **Checkpoints removed** — all `self.emit("cp: ...")` lines removed from
+  `collect_state()`. Inner checkpoints in `read_contacts`/`read_sonar`/`read_ai`
+  remain for freeze diagnosis.
+- **Default config updated** — `read_sonar_arrays: true`, `max_sonar_arrays: 4`,
+  added `read_mission: true`, `read_clock: true`, `measure_perf: false`.
+
+### ship_probe_config.json
+
+- New fields: `read_identity`, `read_navigation`, `read_blackboard`,
+  `read_systems`, `collect_systems_components`, `read_steering`,
+  `read_mission`, `read_clock`, `measure_perf`.
+- `read_sonar_arrays` changed `false` → `true`, `max_sonar_arrays` `8` → `4`.
+
+### Documentation
+
+- **AGENTS.md** — updated from MNW-Tool source; all disassembly/DLL/IL
+  trace references removed. Factual knowledge preserved.
+
+---
+
 ## v2.0 (2026-08-18) — MNW-Tool ship-probe integration
 
 Full sync with `masto/MNW-Tool/ship-probe/` (85 commits). Code files
