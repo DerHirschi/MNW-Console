@@ -2454,7 +2454,8 @@ class IntegrityReadTest(unittest.TestCase):
         cfg = dict(log_dir=tmp, tick_delay=1, heartbeat_every=120, console_log=False,
                    require_player=True, target_element_id=0, max_contacts=50,
                    max_commands_per_cycle=10, allow_commands=[], resolve_positions=True,
-                   state_every=10, read_contacts=False, read_sonar=False)
+                   state_every=10, read_contacts=False, read_sonar=False,
+                   collect_systems_components=True)
         types = {name: type("CompType_%s" % name, (), {}) for name in comps}
         ctrl = IntegrityReadTest.FakeController(
             {types[name]: comps[name] for name in comps})
@@ -3728,7 +3729,8 @@ class MastsWriteTest(unittest.TestCase):
             cfg = dict(log_dir=tmp, tick_delay=1, heartbeat_every=120, console_log=False,
                        require_player=True, target_element_id=0, max_contacts=50,
                        max_commands_per_cycle=10, allow_commands=[], resolve_positions=True,
-                       state_every=10, read_contacts=False, read_sonar=False)
+                   state_every=10, read_contacts=False, read_sonar=False,
+                   collect_systems_components=True)
             host = {"__name__": "sub", "__file__": "sub.py",
                     "_Information": _FakeInfo(), "_Controller": object(),
                     "client": type("C", (), {"_CoordinatesManager": type(
