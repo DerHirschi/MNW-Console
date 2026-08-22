@@ -135,7 +135,7 @@ _BB_REF = None
 _BB_CM = None
 
 # EOT order names the game's MechTools.EOTOrder enum exposes (verified in the
-# AI scripts + disasm of mnw.shared.dll). Console sends the name; the probe
+# AI scripts). Console sends the name; the probe
 # resolves it via the enum. Full telegraph set: AsternEmer=0, AsternFull=1,
 # Astern23=2, Astern13=3, Stop=4, Ahead13=5, Ahead23=6, AheadStd=7, AheadFull=8,
 # AheadFlank=9, SetKnots=10 (SetSpeed), SetTurns=11 (SetTurns), SetTurnsForKnot=12 (SetTPK).
@@ -1053,7 +1053,7 @@ class _Probe(object):
 
     def read_systems(self):
         out = {}
-        # Integrity (disasm-verified mnw.Mechanics.Integrity, all public
+        # Integrity (verified mnw.Mechanics.Integrity, all public
         # property reads; tank components carry IIntegrity.Status enum:
         # Operational=1, Malfunctioning=2, Damaged=4 — see damage command)
         st, comp = self._component("Integrity")
@@ -1548,8 +1548,8 @@ class _Probe(object):
         """Resolve the PLAYER's mnw.Systems.SonarSystem via ctrl.Access[SonarSystem]().
 
         Controller.Access[Type]() was suspected to hang on elements that LACK
-        the component (freeze 2026-08-13), but disassembly (rva 0x3f918) shows
-        Access is a pure _Components-Dictionary lookup (no Unity calls), the
+        the component (freeze 2026-08-13), but Access is a pure
+        _Components-Dictionary lookup (no Unity calls), the
         gate probe proved access_* ok on the PLAYER controller, and the live
         run confirmed Access[SonarSystem]() = ok. The player Virginia is
         sonar-equipped, so SonarSystem is guaranteed present -> Access[] is
@@ -6158,7 +6158,7 @@ class _Probe(object):
         # getters are unsafe to introspect from the Python bridge.
         # The Fire args we need (asg.Domain, asg.Where.Orientation) are
         # captured above. Weapon-side category data stays with the static
-        # IL disassembly (disasm/wc_all.il).
+        # analysis.
 
         # ---- 3b. launcher enumeration ------------------------------
         # INTENTIONALLY NOT dumped live: enumerating launchers means
@@ -6167,8 +6167,8 @@ class _Probe(object):
         # that froze the Unity main thread (2026-08-15, mnw 192% CPU, both
         # logs stopped on the same nanosecond). AGENTS.md Z.80 rule: no
         # un-gated live Component/Access[] reads. Launcher inventory stays
-        # a static-disassembly concern (disasm/wc_all.il).
-        lines.append("  launcher inventory: static disassembly only (no live Access)")
+        # a static-analysis concern.
+        lines.append("  launcher inventory: static analysis only (no live Access)")
         return lines
 
     # ---------------------------------------------------------------

@@ -2381,7 +2381,7 @@ class MastsReadTest(unittest.TestCase):
 
 class IntegrityReadTest(unittest.TestCase):
     """read_systems Integrity block: ratios, flags, per-tank bulkhead/fire/
-    flooding + component status (disasm-verified mnw.Mechanics.Integrity;
+    flooding + component status (verified mnw.Mechanics.Integrity;
     .Status enum: Operational=1, Malfunctioning=2, Damaged=4)."""
 
     class _FakeInfo(object):
