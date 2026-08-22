@@ -3,9 +3,8 @@
 ## v2.0 (2026-08-18) — MNW-Tool ship-probe integration
 
 Full sync with `masto/MNW-Tool/ship-probe/` (85 commits). Code files
-(`ship_probe.py`, `console.py`, `deploy.py`) were already identical; this
-release documents all live-verified knowledge and extends the README/AGENTS
-reference docs.
+(`ship_probe.py`, `console.py`, `deploy.py`) synced, reference docs extended,
+tests added.
 
 ### Commands
 
@@ -26,6 +25,20 @@ reference docs.
   results instead of overwriting each tick.
 - **Prefix-mapping fix** — `int(ContactType.Sonar)` returned wrong tracker index
   (1 = Radar) in IronPython; fixed with `_prefix_to_idx()` string-match.
+- **`dc` command** — damage control: `dc status`, `dc bulkheads close|open`,
+  `dc bulkhead <N> close|open`, `dc lights`. Fire/extinguish/flood/deflood
+  disabled (freeze + mono GC crash).
+- **`damage` command** — read-only integrity + compartment damage view
+  (always-on in `ship_state.json` systems.*).
+- **Expanded Integrity reading** — probe now reads 7 integrity ratios
+  (DamageLevelRatio, OperationalLevelRatio, HullLevelRatio, HullStressRatio,
+  TanksLevelRatio, SunkLevelRatio, PlateStrength), fire/flooding/sunk flags,
+  and per-tank details (bulkhead, fire, flooding, level, component status).
+- **Expanded lights reading** — `lights_enabled` and `lights_navstat` fields.
+- **`alarm control-check`** — Integrity + Coxswain subsystem member probe
+  (Bulkheads, Lights, CIWs).
+- **Tests** — `test_console.py`, `test_deploy.py`, `test_probe_utils.py`,
+  `test_mnw_admin.py` added from MNW-Tool.
 
 ### Safety
 
@@ -57,7 +70,7 @@ reference docs.
 - **Alarm-System Discovery** — brute-force 105+ type names via Access[T](); no
   alarm component found, GQ remains unobservable via probe.
 - **Weapon/Launcher/Platform DBs** — full table inventory with IDs and categories.
-- **Valve/Mast control + Active Sonar Sim** — documented in `PLAN_active_sonar_sim.md`.
+- **Valve/Mast control + Active Sonar Sim** — documented in AGENTS.md.
 
 ### Deployed config (current)
 
