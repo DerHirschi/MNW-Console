@@ -31,7 +31,9 @@ Commands (REPL + one-shot):
   ai [ID] [--registry-only]   list AI elements / show one element
   steer ID LAT LON [--speed K] move AI element ID to position (Transit)
   wc ID                       dump AI element WeaponController internals
-  masts                       show mast / snorkel / periscope / towed state
+masts [raise|retract|...]      mast control (no arg=show state; raise/retract
+                            <id>; retract-all; raise-all; height <id> <frac>;
+                            periscope <id> <frac>; snorkel raise|retract)
   diag                        one-shot diagnostic (results + markers + tail)
 results [N]                 show command results
   log     [N]                 tail ship_probe_log.txt
@@ -84,8 +86,11 @@ TANKS_USAGE = ("tanks [vent | flood | drain | blow | charge | blower | bank N | 
                "(no arg = read-only ballast/trim probe; writes are state-changing)")
 ENV_USAGE = ("env [ssp]  "
              "(no arg = read-only EnvironmentalSystem scan; ssp reads SSP/TP/Analysis properties)")
-ALARM_USAGE = ("alarm [alarms | rigging]  "
-               "(no arg = scan ship alarm + rigging components and blackboard keys)")
+ALARM_USAGE = ("alarm [alarms | rigging | integrity | brute]  "
+               "(no arg = scan; integrity = live damage state; brute = 200+ types)")
+DC_USAGE = ("dc [status | bulkheads close|open | bulkhead <0-9> close|open | "
+            "fire <0-9> | extinguish <0-9> | flood <0-9> | deflood <0-9>]  "
+            "(damage control: bulkheads proven safe, fire/flood experimental)")
 
 
 def resolve_log_dir(args):
@@ -198,9 +203,18 @@ def print_state(d):
         _fmt(n.get("bottom_range"), 1), _fmt(n.get("_currentrpm"), 0)))
     s = d.get("systems") or {}
     if s:
-        print("systems: damage=%s | off=%s | def=%s | towed=%s" % (
+        flags = []
+        for label, key in (("fire", "integrity_on_fire"), ("flood", "integrity_flooding"),
+                           ("sunk", "integrity_sunk")):
+            if s.get(key) is not None:
+                flags.append("%s=%s" % (label, "yes" if s[key] else "no"))
+        if flags:
+            flags = " | " + " ".join(flags)
+        else:
+            flags = ""
+        print("systems: damage=%s | off=%s | def=%s | towed=%s%s" % (
             _fmt(s.get("integrity_damage_ratio"), 3), _fmt(s.get("ammo_offensive_ratio"), 3),
-            _fmt(s.get("ammo_defensive_ratio"), 3), s.get("towed_array", "?")))
+            _fmt(s.get("ammo_defensive_ratio"), 3), s.get("towed_array", "?"), flags))
         for k in ("mast_controller_status", "mast_ids"):
             if s.get(k) is not None:
                 print("  %s: %s" % (k, s[k]))
@@ -239,6 +253,84 @@ def print_state(d):
     son = d.get("sonar") or {}
     if son:
         print("sonar: %s" % son)
+    return 0
+
+
+def format_damage(s):
+    """Render the systems' integrity/compartment damage section into display
+    lines. Pure helper (no IO) so the console 'damage' command and tests share
+    exactly one rendering path."""
+    if not s:
+        return ["  (no systems data)"]
+    if s.get("integrity_damage_ratio") is None:
+        return ["  (no integrity data - ship lacks Integrity component?)"]
+    lines = ["  damage=%-8s oper=%-8s hull=%-8s stress=%-8s tanks=%-8s sink=%-8s plate=%s" % (
+        _fmt(s.get("integrity_damage_ratio"), 4),
+        _fmt(s.get("integrity_operational_ratio"), 4),
+        _fmt(s.get("integrity_hull_ratio"), 4),
+        _fmt(s.get("integrity_hull_stress"), 4),
+        _fmt(s.get("integrity_tanks_ratio"), 4),
+        _fmt(s.get("integrity_sunk_ratio"), 4),
+        _fmt(s.get("integrity_plate_strength"), 4))]
+    flags = []
+    for label, key, yes, no in (
+            ("fire", "integrity_on_fire", "yes", "no"),
+            ("flooding", "integrity_flooding", "yes", "no"),
+            ("sunk", "integrity_sunk", "yes", "no")):
+        v = s.get(key)
+        if v is not None:
+            flags.append("%s=%s" % (label, yes if v else no))
+    ntanks = s.get("integrity_tanks")
+    if ntanks is not None:
+        nfire = nflood = nbulk = 0
+        for i in range(int(ntanks)):
+            pref = "tank_%d" % i
+            if s.get(pref + "_fire"):
+                nfire += 1
+            if s.get(pref + "_flooding"):
+                nflood += 1
+            if s.get(pref + "_bulkhead"):
+                nbulk += 1
+        flags.append("tanks=%s (%s fire, %s flooding, %s bulkheads shut)" % (
+            ntanks, nfire, nflood, nbulk))
+    if flags:
+        lines.append("  %s" % " | ".join(flags))
+    for i in range(int(ntanks or 0)):
+        pref = "tank_%d" % i
+        bits = []
+        lv = s.get(pref + "_level")
+        if lv is not None:
+            bits.append("level=%s" % _fmt(lv, 3))
+        for label, key, open_s, shut_s in (
+                ("bulkhead", pref + "_bulkhead", "open", "shut"),
+                ("fire", pref + "_fire", "yes", "no"),
+                ("flooding", pref + "_flooding", "yes", "no")):
+            v = s.get(key)
+            if v is not None:
+                bits.append("%s=%s" % (label, open_s if v else shut_s))
+        for label, key in (("ok", pref + "_comps_ok"), ("malf", pref + "_comps_malf"),
+                           ("dmg", pref + "_comps_dmg"), ("other", pref + "_comps_other")):
+            v = s.get(key)
+            if v is not None:
+                bits.append("%s=%d" % (label, int(v)))
+        damaged = s.get(pref + "_damaged")
+        if damaged:
+            bits.append("damaged: %s" % ", ".join(str(d) for d in damaged[:8]))
+        lines.append("  tank %d: %s" % (i, " | ".join(bits)))
+    return lines
+
+
+def cmd_damage(log_dir):
+    """Read-only damage view: renders the always-on integrity section that
+    read_systems() in the probe polls into ship_state.json (systems.*). No
+    probe round-trip - the data is refreshed by the probe's state cycle."""
+    d = read_json(os.path.join(log_dir, STATE_FILE))
+    if d is None or (isinstance(d, dict) and d.get("__error__")):
+        print_state(d)
+        return 1
+    print("== damage (ts=%s) ==" % d.get("ts", "?"))
+    for line in format_damage((d.get("systems") or {})):
+        print(line)
     return 0
 
 
@@ -310,6 +402,92 @@ def cmd_sonar(log_dir, detail=False):
                         print("      %s=%s" % (k, _fmt(c[k], 3) if isinstance(c[k], (int, float)) else c[k]))
         if len(contacts) > 20:
             print("    ... %d more" % (len(contacts) - 20))
+    return 0
+
+
+EXPLORE_FILE = "ship_explore.json"
+
+def cmd_explore(log_dir):
+    """Read ship_explore.json (written by do_explore) and print a human-readable summary."""
+    path = os.path.join(log_dir, EXPLORE_FILE)
+    try:
+        with io.open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (IOError, OSError, ValueError):
+        print("(no ship_explore.json — run 'explore' first, wait for probe cycle)")
+        return 1
+    # Save a local copy in the working directory
+    try:
+        local_copy = os.path.join(os.getcwd(), EXPLORE_FILE)
+        with io.open(local_copy, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    if not isinstance(data, dict):
+        print("(invalid ship_explore.json)")
+        return 1
+    print("=== FULL EXPLORATION DUMP (%s) ===" % data.get("ts", "?"))
+    # --- Player Element ---
+    pe = data.get("player_element")
+    if pe:
+        print("\n-- Player Element dir() [%d attrs] --" % len(pe.get("attrs", [])))
+        for a in pe.get("attrs", []):
+            print("  %s: %s" % (a["name"], a.get("val", "?")))
+        calls = pe.get("callables", [])
+        if calls:
+            print("  [%d callables: %s]" % (len(calls), ", ".join(calls[:20])))
+    # --- Access[T] components ---
+    access = data.get("access", {})
+    if access:
+        for tname, tdata in sorted(access.items()):
+            if isinstance(tdata, dict) and tdata.get("error"):
+                continue
+            attrs = tdata if isinstance(tdata, dict) else {}
+            prop_list = attrs.get("properties", [])
+            call_list = attrs.get("callables", [])
+            print("\n-- Access[%s] [%d props, %d callables] --" % (
+                tname, len(prop_list), len(call_list)))
+            for a in prop_list:
+                print("  %s: %s" % (a["name"], a.get("val", "?")))
+            if call_list:
+                print("  [%d callables: %s]" % (len(call_list), ", ".join(call_list[:15])))
+    # --- Blackboard ---
+    bb = data.get("blackboard")
+    if bb:
+        keys = bb.get("keys", [])
+        print("\n-- Blackboard [%d keys] --" % len(keys))
+        for k in keys:
+            vr = bb.get("values", {}).get(k)
+            tag = " <<" if any(x in k.lower() for x in ("bearing", "sonar", "audio", "headphone")) else ""
+            print("  %s: %s%s" % (k, vr if vr is not None else "?", tag))
+    # --- SonarSystem ---
+    ss = data.get("sonar_system")
+    if ss:
+        prop_list = ss.get("properties", [])
+        call_list = ss.get("callables", [])
+        print("\n-- SonarSystem [%d props, %d callables] --" % (len(prop_list), len(call_list)))
+        for a in prop_list:
+            print("  %s: %s" % (a["name"], a.get("val", "?")))
+        if call_list:
+            print("  [%d callables: %s]" % (len(call_list), ", ".join(call_list[:15])))
+        sonars = ss.get("sonars", [])
+        if sonars:
+            print("  Sonars: %d items" % len(sonars))
+            for si, s in enumerate(sonars):
+                print("    [%d] %s" % (si, s))
+        cc = ss.get("cached_contacts", [])
+        if cc:
+            print("  CachedContacts: %d items" % len(cc))
+            for c in cc[:5]:
+                if isinstance(c, dict):
+                    print("    key=%s %s" % (c.get("key", "?"), c.get("attrs", "")))
+    # --- Summary ---
+    summary = data.get("summary", {})
+    if summary:
+        print("\n-- Summary --")
+        for k, v in summary.items():
+            print("  %s: %s" % (k, v))
+    print("\nFull data: %s" % path)
     return 0
 
 
@@ -793,7 +971,7 @@ def parse_action(words):
         sub = args[0].lower() if args else None
         if not sub:
             return {"action": action}, None
-        if sub in ("alarms", "rigging"):
+        if sub in ("alarms", "rigging", "integrity", "brute"):
             return {"action": action, "sub": sub}, None
         return None, ALARM_USAGE
     if action in ("rig", "rigging"):
@@ -837,18 +1015,135 @@ def parse_action(words):
                     "bearing": args[2]}, None
         if sub == "diag":
             return {"action": action, "sub": "diag"}, None
-        return None, "sonctl auto|ids|track|untrack|data|mark|diag"
+        if sub == "explore":
+            target = args[1] if len(args) > 1 else "all"
+            return {"action": action, "sub": "explore", "target": target}, None
+        return None, "sonctl auto|ids|track|untrack|data|mark|diag|explore"
     if action == "tracker":
         if not args:
             return {"action": action, "sub": ""}, None
         sub = args[0].lower()
+        if sub == "raw":
+            return {"action": action, "sub": "raw"}, None
+        if sub.isdigit():
+            sub = {"0": "visual", "1": "radar", "2": "esm", "3": "radio",
+                   "4": "weapon", "5": "ais", "6": "active", "7": "manual"}.get(sub, sub)
         if sub in ("visual", "radar", "esm", "radio", "weapon", "ais", "active", "manual"):
-            return {"action": action, "sub": sub}, None
-        return None, "tracker [visual|radar|esm|radio|weapon|ais|active|manual]"
+            # tracker TYPE [ID|clear|clearid ID|loadsnap STR|tkdump ID]
+            if len(args) == 1:
+                return {"action": action, "sub": sub}, None
+            if args[1].lower() == "clear":
+                return {"action": action, "sub": sub, "mode": "clear"}, None
+            if args[1].lower() == "clearid":
+                if len(args) < 3:
+                    return None, "tracker %s clearid <ID>" % sub
+                return {"action": action, "sub": sub, "mode": "clearid", "trackid": args[2]}, None
+            if args[1].lower() == "loadsnap":
+                if len(args) < 3:
+                    return None, "tracker %s loadsnap <SNAPSHOT>" % sub
+                return {"action": action, "sub": sub, "mode": "loadsnap", "snap": args[2]}, None
+            if args[1].lower() == "tkdump":
+                if len(args) < 3:
+                    return None, "tracker %s tkdump <ID>" % sub
+                return {"action": action, "sub": sub, "mode": "tkdump", "trackid": args[2]}, None
+            # tracker TYPE ID -> getter probe
+            return {"action": action, "sub": sub, "trackid": args[1]}, None
+        if sub == "new":
+            # tracker new TYPE ID  -> manual track creation via TrackerManager.New
+            if len(args) < 3:
+                return None, "tracker new <TYPE> <ID>"
+            ttype = args[1].lower()
+            if ttype.isdigit():
+                ttype = {"0": "visual", "1": "radar", "2": "esm", "3": "radio",
+                         "4": "weapon", "5": "ais", "6": "active", "7": "manual"}.get(ttype, ttype)
+            if ttype not in ("visual", "radar", "esm", "radio", "weapon", "ais", "active", "manual"):
+                return None, "tracker new <TYPE> <ID>  (TYPE: visual|radar|esm|radio|weapon|ais|active|manual or 0-7)"
+            return {"action": "tracker-new", "type": ttype, "id": args[2]}, None
+        return None, "tracker [TYPE [ID|clear|clearid ID|loadsnap STR|tkdump ID]] | tracker new <TYPE> <ID> | tracker raw"
     if action in ("radar", "esm"):
         return {"action": "tracker", "sub": action}, None
     if action == "diag":
         return {"action": "diag"}, None
+    if action == "damage":
+        return {"action": action}, None
+    if action == "dc":
+        sub = args[0].lower() if args else None
+        if not sub:
+            return None, DC_USAGE
+        if sub == "status":
+            return {"action": action, "sub": "status"}, None
+        if sub == "bulkheads":
+            if len(args) < 2 or args[1].lower() not in ("close", "open"):
+                return None, "dc bulkheads close|open"
+            return {"action": action, "sub": "bulkheads", "val": args[1].lower()}, None
+        if sub == "bulkhead":
+            if len(args) < 3:
+                return None, "dc bulkhead <0-9> close|open"
+            try:
+                idx = int(args[1])
+            except ValueError:
+                return None, "dc bulkhead <0-9> close|open"
+            if args[2].lower() not in ("close", "open"):
+                return None, "dc bulkhead <0-9> close|open"
+            return {"action": action, "sub": "bulkhead", "idx": idx, "val": args[2].lower()}, None
+        if sub == "lights":
+            return {"action": action, "sub": "lights"}, None
+        if sub == "fire":
+            if len(args) < 2:
+                return None, "dc fire <0-9>"
+            try:
+                return {"action": action, "sub": "fire", "idx": int(args[1])}, None
+            except ValueError:
+                return None, "dc fire <0-9>"
+        if sub == "extinguish":
+            if len(args) < 2:
+                return None, "dc extinguish <0-9>"
+            try:
+                return {"action": action, "sub": "extinguish", "idx": int(args[1])}, None
+            except ValueError:
+                return None, "dc extinguish <0-9>"
+        if sub == "flood":
+            if len(args) < 2:
+                return None, "dc flood <0-9>"
+            try:
+                return {"action": action, "sub": "flood", "idx": int(args[1])}, None
+            except ValueError:
+                return None, "dc flood <0-9>"
+        if sub == "deflood":
+            if len(args) < 2:
+                return None, "dc deflood <0-9>"
+            try:
+                return {"action": action, "sub": "deflood", "idx": int(args[1])}, None
+            except ValueError:
+                return None, "dc deflood <0-9>"
+        return None, DC_USAGE
+    if action == "masts":
+        sub = args[0].lower() if args else None
+        if not sub:
+            return {"action": "masts"}, None
+        if sub in ("raise", "retract"):
+            if len(args) < 2:
+                return None, "masts %s <id>" % sub
+            return {"action": "masts", "sub": sub, "id": args[1]}, None
+        if sub == "retract-all":
+            return {"action": "masts", "sub": "retract-all"}, None
+        if sub == "raise-all":
+            return {"action": "masts", "sub": "raise-all"}, None
+        if sub == "height":
+            if len(args) < 3:
+                return None, "masts height <id> <0.0-1.0>"
+            return {"action": "masts", "sub": "height", "id": args[1], "val": args[2]}, None
+        if sub == "periscope":
+            if len(args) < 3:
+                return None, "masts periscope <id> <0.0-1.0>"
+            return {"action": "masts", "sub": "periscope", "id": args[1], "val": args[2]}, None
+        if sub == "snorkel":
+            if len(args) < 3:
+                return None, "masts snorkel raise|retract"
+            return {"action": "masts", "sub": "snorkel_%s" % args[2].lower()}, None
+        return None, "masts [raise|retract|retract-all|raise-all|height|periscope|snorkel]"
+    if action == "explore":
+        return {"action": "explore"}, None
     return None, None
 
 
@@ -898,17 +1193,38 @@ env                         SonarSim environment scan (EnvironmentalSystem,
                             SSP/RayTrace/bathymetry members, own sound) +
                             full detail dump
 env ssp                     read SSP/TP/Analysis properties live (arrays)
-alarm                       scan ship alarm + rigging components + blackboard
-                            keys (alarm alarms | alarm rigging restrict)
+alarm [integrity|brute]        scan alarm+rigging components; integrity=live
+                            damage state dump; brute=200+ type names
+damage                      integrity + compartment damage state (always-on in
+                            ship_state.json systems.*; detail view here)
+dc                          damage control (write commands to probe)
+  dc status                   same as 'damage' (read-only)
+  dc bulkheads close|open     ship-level bulkheads (CloseBulkheads/OpenBulkheads)
+  dc bulkhead <0-9> close|open  per-tank bulkhead (SetBulkheadStatus)
+  dc lights                   show NAVSTAT codes + lights state (read-only)
+  dc fire <0-9>               DISABLED (freeze + mono GC crash)
+  dc extinguish <0-9>         DISABLED (freeze + mono GC crash)
+  dc flood <0-9>              DISABLED (freeze + mono GC crash)
+  dc deflood <0-9>            DISABLED (freeze + mono GC crash)
 sonctl auto|ids|track|...   sonar tracker control (auto on|off, ids, track ID,
                             untrack GUID TYPE, data ID, mark ID BEARING, diag)
 tracker [TYPE]              FireControl tracker managers + contacts by sensor
-                            (radar|esm|visual|radio|weapon|ais|active|manual)
+tracker TYPE ID             probe all getters for a track id (GetBearing/GetRange/...)
+tracker TYPE clear          clear all tracks (Clear()/Clear(0) attempts)
+tracker TYPE clearid <ID>   remove one track
+tracker TYPE loadsnap <STR> LoadSnapshot test (1-arg + 2-arg attempt)
+tracker TYPE tkdump <ID>    dump ContactData fields of GetTrack(cid)
+tracker new <TYPE> <ID>     manually create a track on a TrackerManager (New)
+                            (radar|esm|visual|radio|weapon|ais|active|manual or 0-7)
+tracker raw                 raw ContactManager diagnostics (GetUsed ids + prefixes)
 radar / esm                 shortcut for tracker radar / tracker esm
 sonar [--detail]            player sonar tracker contacts (bearing/range/sensor
                             per contact from GetContactIDs/GetTrackerData) +
                             per-array contacts (--detail adds noise/doppler)
 masts                       show mast / snorkel / periscope / towed state
+explore                     full internal structure dump -> ship_explore.json
+                            (player element, all Access[T] components, blackboard,
+                            sonar system — everything in one shot, no restart needed)
 diag                        one-shot: results + ai-attack log markers + tail
 results [N]                 show command results
 log     [N]                 tail ship_probe_log.txt
@@ -946,7 +1262,13 @@ def repl(log_dir):
             cmd_sonar(log_dir, detail="--detail" in words[1:])
             continue
         if head == "masts":
-            cmd_masts(log_dir)
+            cmd, err = parse_action(words)
+            if err:
+                print("usage: %s" % err)
+                continue
+            if cmd is None:
+                continue
+            cmd_action_dump(log_dir, cmd)
             continue
         if head == "planes":
             if len(words) == 1:
@@ -1019,8 +1341,29 @@ def repl(log_dir):
                 continue
             cmd_action_dump(log_dir, cmd)
             continue
+        if head == "explore":
+            cmdid = next_cmdid(log_dir)
+            n = send_commands(log_dir, [{"action": "explore"}])
+            print("queued explore - waiting for probe cycle (this takes ~2-3 ticks)...")
+            time.sleep(6.0)
+            return cmd_explore(log_dir)
         if head == "probe":
             cmd_probe_file(log_dir)
+            continue
+        if head == "damage":
+            cmd_damage(log_dir)
+            continue
+        if head == "dc":
+            cmd, err = parse_action(words)
+            if err:
+                print("usage: %s" % err)
+                continue
+            if cmd is None:
+                continue
+            if cmd.get("sub") == "status":
+                cmd_damage(log_dir)
+            else:
+                cmd_action_dump(log_dir, cmd)
             continue
         if head == "status":
             cmd_status(log_dir)
@@ -1065,7 +1408,7 @@ def repl(log_dir):
         cmdid = next_cmdid(log_dir)
         n = send_commands(log_dir, [cmd])
         print("queued %d command(s) - waiting for probe cycle..." % n)
-        if cmd["action"] in ("detected", "ai-contacts", "ns-dump", "asg", "sonctl", "tracker"):
+        if cmd["action"] in ("detected", "ai-contacts", "ns-dump", "asg", "sonctl", "tracker", "tracker-new"):
             time.sleep(1.5)
             cmd_result_for(log_dir, cmdid, wait=8.0)
         else:
@@ -1091,6 +1434,8 @@ def main():
     if rest:
         if rest[0].lower() == "probe":
             return cmd_probe_file(log_dir)
+        if rest[0].lower() == "damage":
+            return cmd_damage(log_dir)
         if rest[0].lower() == "ai":
             nid = None
             registry_only = False
@@ -1110,7 +1455,14 @@ def main():
         if rest[0].lower() == "sonar":
             return cmd_sonar(log_dir, detail="--detail" in rest[1:])
         if rest[0].lower() == "masts":
-            return cmd_masts(log_dir)
+            cmd, err = parse_action(rest)
+            if err:
+                print("usage: %s" % err)
+                return 2
+            if cmd is None:
+                print("unknown command %r" % rest[0])
+                return 2
+            return cmd_action_dump(log_dir, cmd)
         if rest[0].lower() == "planes":
             if len(rest) == 1:
                 return cmd_planes_state(log_dir)
@@ -1123,7 +1475,7 @@ def main():
             print("queued %d command(s)" % n)
             time.sleep(1.2)
             return cmd_result_for(log_dir, cmdid, wait=8.0)
-        if rest[0].lower() in ("tanks", "env", "alarm", "sonctl", "tracker"):
+        if rest[0].lower() in ("tanks", "env", "alarm", "sonctl", "tracker", "masts"):
             cmd, err = parse_action(rest)
             if err:
                 print("usage: %s" % err)
@@ -1132,6 +1484,12 @@ def main():
                 print("unknown command %r" % rest[0])
                 return 2
             return cmd_action_dump(log_dir, cmd)
+        if rest[0].lower() == "explore":
+            cmdid = next_cmdid(log_dir)
+            n = send_commands(log_dir, [{"action": "explore"}])
+            print("queued explore - waiting for probe cycle (~6s)...")
+            time.sleep(6.0)
+            return cmd_explore(log_dir)
         cmd, err = parse_action(rest)
         if err:
             print("usage: %s" % err)
