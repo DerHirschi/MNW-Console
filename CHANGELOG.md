@@ -33,11 +33,6 @@ state_every bug fix, reduced checkpoint noise.
   `read_mission`, `read_clock`, `measure_perf`.
 - `read_sonar_arrays` changed `false` → `true`, `max_sonar_arrays` `8` → `4`.
 
-### Documentation
-
-- **AGENTS.md** — updated from MNW-Tool source; all disassembly/DLL/IL
-  trace references removed. Factual knowledge preserved.
-
 ---
 
 ## v2.0 (2026-08-18) — MNW-Tool ship-probe integration
@@ -97,8 +92,6 @@ tests added.
 
 ### Documentation
 
-- **AGENTS.md** — sanitized: removed all disassembly/DLL/IL trace references while
-  preserving verified API knowledge and live-tested findings.
 - **README.md** — expanded tracker sub-commands, tracker notes, freeze warning.
 - **Launcher Categorization** — fully documented from live testing: `CollectFlags`,
   `CollectWeaponInformation`, `Core.Select`, `GetCandidates`, `DetermineAttackSide`,
