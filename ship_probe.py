@@ -51,7 +51,7 @@ _DEFAULTS = {
     "target_element_id": 0,
     "max_contacts": 50,
     "max_commands_per_cycle": 10,
-    "allow_commands": ["helm", "planes", "sd-dump", "tanks", "env", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new"],
+    "allow_commands": ["helm", "planes", "sd-dump", "tanks", "env", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc"],
     "resolve_positions": False,
     "state_every": 3,
     "read_contacts": True,
@@ -542,6 +542,7 @@ class _Probe(object):
         self.cfg = cfg
         self.tick_count = 0
         self.state_count = 0
+        self._dc_deferred = []
         self.log_dirs = _resolve_log_dirs(cfg)
         self.log_dir = self.log_dirs[0]
         self.log = _Log([os.path.join(d, _LOG_NAME) for d in self.log_dirs], bool(cfg.get("console_log")))
@@ -1044,12 +1045,77 @@ class _Probe(object):
 
     def read_systems(self):
         out = {}
-        # Integrity
+        # Integrity (disasm-verified mnw.Mechanics.Integrity, all public
+        # property reads; tank components carry IIntegrity.Status enum:
+        # Operational=1, Malfunctioning=2, Damaged=4 — see damage command)
         st, comp = self._component("Integrity")
-        if st == "ok":
-            r = _try(lambda: comp.DamageLevelRatio)
-            if r[0] == "ok":
-                out["integrity_damage_ratio"] = _safe_num(r[1], 4)
+        if st == "ok" and comp is not None:
+            for name, fn in (
+                ("integrity_damage_ratio", lambda: comp.DamageLevelRatio),
+                ("integrity_operational_ratio", lambda: comp.OperationalLevelRatio),
+                ("integrity_hull_ratio", lambda: comp.HullLevelRatio),
+                ("integrity_hull_stress", lambda: comp.HullStressRatio),
+                ("integrity_tanks_ratio", lambda: comp.TanksLevelRatio),
+                ("integrity_sunk_ratio", lambda: comp.SunkLevelRatio),
+                ("integrity_plate_strength", lambda: comp.PlateStrength),
+            ):
+                r = _try(fn)
+                if r[0] == "ok":
+                    out[name] = _safe_num(r[1], 4)
+            for name, fn in (
+                ("integrity_on_fire", lambda: bool(comp.OnFire)),
+                ("integrity_flooding", lambda: bool(comp.Flooding)),
+                ("integrity_sunk", lambda: bool(comp.IsSunk)),
+            ):
+                r = _try(fn)
+                if r[0] == "ok":
+                    out[name] = r[1]
+            r = _try(lambda: list(comp.IntegrityTanks))
+            if r[0] == "ok" and r[1]:
+                tanks = r[1][:50]
+                out["integrity_tanks"] = len(tanks)
+                for i, tank in enumerate(tanks):
+                    pref = "tank_%d" % i
+                    for name, fn in (
+                        ("bulkhead", lambda tank=tank: bool(tank.IsBulkheadDoorOpen)),
+                        ("fire", lambda tank=tank: bool(tank.IsOnFire)),
+                        ("flooding", lambda tank=tank: bool(tank.IsFlooding)),
+                    ):
+                        r2 = _try(fn)
+                        if r2[0] == "ok":
+                            out["%s_%s" % (pref, name)] = r2[1]
+                    r2 = _try(lambda tank=tank: tank.LevelRatio)
+                    if r2[0] == "ok":
+                        out["%s_level" % pref] = _safe_num(r2[1], 4)
+                    r2 = _try(lambda tank=tank: list(tank.Components))
+                    if r2[0] != "ok" or not r2[1]:
+                        continue
+                    counts = {"ok": 0, "malf": 0, "dmg": 0, "other": 0}
+                    damaged = []
+                    for c in r2[1][:32]:
+                        r3 = _try(lambda c=c: int(c.Status))
+                        if r3[0] != "ok":
+                            counts["other"] += 1
+                            continue
+                        s = r3[1]
+                        if s == 1:
+                            counts["ok"] += 1
+                        elif s == 2:
+                            counts["malf"] += 1
+                        elif s == 4:
+                            counts["dmg"] += 1
+                            r4 = _try(lambda c=c: str(c.ComponentDescription))
+                            if r4[0] == "ok" and r4[1]:
+                                damaged.append(r4[1][:40])
+                        else:
+                            counts["other"] += 1
+                    out["%s_comps_ok" % pref] = counts["ok"]
+                    out["%s_comps_malf" % pref] = counts["malf"]
+                    out["%s_comps_dmg" % pref] = counts["dmg"]
+                    if counts["other"]:
+                        out["%s_comps_other" % pref] = counts["other"]
+                    if damaged:
+                        out["%s_damaged" % pref] = damaged[:8]
         # Ammunition
         st, comp = self._component("AmmunitionStorage")
         if st == "ok":
@@ -1153,8 +1219,11 @@ class _Probe(object):
             if r[0] == "ok":
                 out["bulkheads"] = _desc(r[1], 80)
             r = _try(lambda: comp.Lights)
-            if r[0] == "ok":
-                out["lights"] = _desc(r[1], 80)
+            if r[0] == "ok" and r[1] is not None:
+                lights = r[1]
+                out["lights_enabled"] = _try(lambda: bool(lights.IsSystemEnabled))[1] if _try(lambda: bool(lights.IsSystemEnabled))[0] == "ok" else None
+                nav = _try(lambda: str(lights.NAVSTATCodes))
+                out["lights_navstat"] = nav[1] if nav[0] == "ok" else None
             r = _try(lambda: comp.CIWs)
             if r[0] == "ok":
                 out["ciws"] = _desc(r[1], 80)
@@ -2359,7 +2428,7 @@ class _Probe(object):
     # command dispatch (CONTROL side)
     # ---------------------------------------------------------------
 
-    _ACTIONS = ("helm", "planes", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "sd-dump", "tanks", "env", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new")
+    _ACTIONS = ("helm", "planes", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "sd-dump", "tanks", "env", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc")
 
     # Commands whose native access is ELEMENT-scoped (target a specific
     # element id in the CALLING host's interpreter namespace). Command-only
@@ -3173,6 +3242,67 @@ class _Probe(object):
                             r"quarters|battle|vent|hatch|repair", k, re.I):
                         lines.append("bb: %s = %s" % (k, _desc(v, 40)))
             return lines
+        if sub == "control-check":
+            lines = ["alarm control-check: damage/damage-control surface"]
+            st_i, comp_i = self._component("Integrity")
+            st_c, comp_c = self._component("Coxswain")
+            if st_i == "ok" and comp_i is not None:
+                # Integrity control-relevant members
+                ctrl_names = [
+                    "SetPointFire", "ExtinguishPointFromFire",
+                    "BeginTankFlooding", "StopTankFlooding",
+                    "ExplosionDamage", "ImpactDamage", "CollisionDamage",
+                    "Shock", "Damage", "ForceDamage",
+                ]
+                for m in ctrl_names:
+                    r = _try(lambda m=m: getattr(comp_i, m))
+                    tag = "callable" if r[0] == "ok" and callable(r[1]) else ("val=%s" % str(r[1])[:40] if r[0] == "ok" else r[0])
+                    lines.append("Integrity.%s -> %s" % (m, tag))
+                # Tanks
+                tanks_count = _try(lambda: comp_i.IntegrityTanks.Count)
+                tcnt = tanks_count[1] if tanks_count[0] == "ok" else 0
+                lines.append("IntegrityTanks count = %s" % str(tcnt))
+                tank_methods = [
+                    "SetBulkheadStatus", "SetFire", "ExtinguishFire",
+                    "BeginFlooding", "StopFlooding",
+                    "ForceDamage", "Shock", "Clear",
+                ]
+                for i in range(min(tcnt if isinstance(tcnt, int) else 0, 10)):
+                    tank = _try(lambda i=i: comp_i.IntegrityTanks[i])
+                    if tank[0] != "ok" or tank[1] is None:
+                        continue
+                    tank_obj = tank[1]
+                    present = []
+                    absent = []
+                    for m in tank_methods:
+                        r = _try(lambda m=m: getattr(tank_obj, m))
+                        if r[0] == "ok" and r[1] is not None:
+                            present.append(m + ("()" if callable(r[1]) else "=%s" % str(r[1])[:30]))
+                        else:
+                            absent.append(m)
+                    lines.append("Tank[%d]: present=%s absent=%s" % (
+                        i, ",".join(present) or "-", ",".join(absent) or "-"))
+            else:
+                lines.append("no Integrity (%s)" % st_i)
+            if st_c == "ok" and comp_c is not None:
+                # Coxswain subsystems
+                for sub_name in ("Bulkheads", "Lights", "CIWs"):
+                    r = _try(lambda sub_name=sub_name: getattr(comp_c, sub_name))
+                    if r[0] == "ok" and r[1] is not None:
+                        obj = r[1]
+                        members = [m for m in dir(obj) if not m.startswith("_")]
+                        ctrl_relevant = [m for m in members if m in (
+                            "CloseBulkheads", "OpenBulkheads", "IsSystemEnabled",
+                            "SetCode", "SetLightState", "LightsOff", "LightsOn",
+                            "EnableCIWs", "DisableCIWs",
+                        )]
+                        lines.append("Coxswain.%s: %d members, ctrl=%s" % (
+                            sub_name, len(members), ",".join(ctrl_relevant) or "-"))
+                    else:
+                        lines.append("Coxswain.%s: not resolved" % sub_name)
+            else:
+                lines.append("no Coxswain (%s)" % st_c)
+            return lines
         member_hints = (
             "Name", "State", "Active", "IsActive", "CurrentAlarm",
             "AlarmType", "AlarmSeverity", "Raise", "Trigger", "Signal",
@@ -3272,6 +3402,113 @@ class _Probe(object):
             tried = sorted(set(n for names in families.values() for n in names))
             lines.append("no alarm/rigging component resolved (tried: %s)"
                          % ", ".join(tried))
+        return lines
+
+    def do_dc(self, cmd):
+        """Damage control (control command).
+
+        Sub-commands:
+          dc status                     same as alarm integrity (read-only)
+          dc bulkheads close|open       ship-level bulkheads (CloseBulkheads/OpenBulkheads)
+          dc bulkhead <0-9> close|open  per-tank bulkhead (SetBulkheadStatus)
+          dc lights                     show NAVSTAT codes + lights state (read-only)
+          dc fire <0-9>                 DISABLED (freeze + mono GC crash)
+          dc extinguish <0-9>           DISABLED (freeze + mono GC crash)
+          dc flood <0-9>                DISABLED (freeze + mono GC crash)
+          dc deflood <0-9>              DISABLED (freeze + mono GC crash)
+
+        fire/extinguish/flood/deflood DISABLED: both C# method calls
+        (AddBehaviour freeze) and setattr() (mono GC crash via pythonnet
+        reflection) are unsafe on IntegrityTank objects.
+        Use in-game damage control instead."""
+        sub = str(cmd.get("sub") or "").lower()
+        lines = ["dc: damage control"]
+        if sub == "status":
+            return self.do_alarm({"sub": "integrity"})
+        # resolve Integrity + Coxswain
+        st_i, integ = self._component("Integrity")
+        st_c, cox = self._component("Coxswain")
+        if sub == "bulkheads":
+            val = cmd.get("val", "")
+            if st_c != "ok" or cox is None:
+                lines.append("no Coxswain (%s)" % st_c)
+                return lines
+            bh_obj = _try(lambda: getattr(cox, "Bulkheads"))
+            if bh_obj[0] != "ok" or bh_obj[1] is None:
+                lines.append("no Bulkheads subsystem")
+                return lines
+            bh = bh_obj[1]
+            if val == "close":
+                r = _try(lambda: bh.CloseBulkheads())
+                lines.append("CloseBulkheads(): %s" % ("ok" if r[0] == "ok" else r[1]))
+            elif val == "open":
+                r = _try(lambda: bh.OpenBulkheads())
+                lines.append("OpenBulkheads(): %s" % ("ok" if r[0] == "ok" else r[1]))
+            else:
+                lines.append("usage: dc bulkheads close|open")
+            return lines
+        if sub == "bulkhead":
+            idx = cmd.get("idx")
+            val = cmd.get("val", "")
+            if idx is None or not isinstance(idx, int) or idx < 0:
+                lines.append("usage: dc bulkhead <0-9> close|open")
+                return lines
+            if st_i != "ok" or integ is None:
+                lines.append("no Integrity (%s)" % st_i)
+                return lines
+            tc = _try(lambda: integ.IntegrityTanks.Count)
+            if tc[0] != "ok" or not isinstance(tc[1], int) or idx >= tc[1]:
+                lines.append("invalid tank index %s (count=%s)" % (idx, tc[1] if tc[0] == "ok" else "?"))
+                return lines
+            tank = _try(lambda idx=idx: integ.IntegrityTanks[idx])
+            if tank[0] != "ok" or tank[1] is None:
+                lines.append("cannot access tank %d" % idx)
+                return lines
+            close = val == "close"
+            r = _try(lambda idx=idx, v=close: integ.IntegrityTanks[idx].SetBulkheadStatus(v))
+            lines.append("tank %d SetBulkheadStatus(%s): %s" % (
+                idx, close, "ok" if r[0] == "ok" else r[1]))
+            return lines
+        if sub == "lights":
+            st_c, comp = self._component("Coxswain")
+            if st_c != "ok" or comp is None:
+                lines.append("no Coxswain (%s)" % st_c)
+                return lines
+            r = _try(lambda: comp.Lights)
+            if r[0] != "ok" or r[1] is None:
+                lines.append("no Lights subsystem (%s)" % r[1])
+                return lines
+            lights = r[1]
+            en = _try(lambda: bool(lights.IsSystemEnabled))
+            nav = _try(lambda: str(lights.NAVSTATCodes))
+            lines.append("Lights enabled=%s" % (en[1] if en[0] == "ok" else "?"))
+            lines.append("NAVSTATCodes (current): %s" % (nav[1] if nav[0] == "ok" else "?"))
+            # Enum all NAVSTATCodes values
+            et = self.g("ElementTools")
+            if et is not None:
+                navtype = _try(lambda: et.NAVSTATCodes)
+                if navtype[0] == "ok" and navtype[1] is not None:
+                    names = _try(lambda: list(__import__("System").Enum.GetNames(navtype[1])))
+                    if names[0] == "ok":
+                        lines.append("NAVSTATCodes enum (%d values):" % len(names[1]))
+                        for n in names[1]:
+                            val = _try(lambda n=n: int(__import__("System").Enum.Parse(navtype[1], n)))
+                            lines.append("  %s = %s" % (n, val[1] if val[0] == "ok" else "?"))
+                    else:
+                        lines.append("Enum.GetNames failed: %s" % names[1])
+                else:
+                    lines.append("NAVSTATCodes type: %s" % navtype[1])
+            else:
+                lines.append("ElementTools not available")
+            return lines
+        if sub in ("fire", "extinguish", "flood", "deflood"):
+            lines.append("dc %s: DISABLED — all IntegrityTank write methods and" % sub)
+            lines.append("  even setattr() on Unity objects freeze the game")
+            lines.append("  (pythonnet reflection hits Unity main thread).")
+            lines.append("  Use in-game damage control instead.")
+            return lines
+        lines.append("usage: dc [status|bulkheads close|open|bulkhead <0-9> close|open|"
+                     "lights|fire <0-9>|extinguish <0-9>|flood <0-9>|deflood <0-9>]")
         return lines
 
     MASTS_USAGE = (
@@ -5924,10 +6161,24 @@ class _Probe(object):
     # loop
     # ---------------------------------------------------------------
 
+    def _drain_dc_deferred(self):
+        """Execute deferred AddBehaviour/RemoveBehaviour calls at tick START.
+
+        These must run before the engine iterates its behaviour list.
+        The freeze was caused by calling these mid-tick (concurrent
+        modification of the tick listener list)."""
+        q = self._dc_deferred
+        self._dc_deferred = []
+        for fn, desc in q:
+            r = _try(fn)
+            if r[0] != "ok":
+                self.emit("dc deferred %s failed: %s" % (desc, r[1]))
+
     def tick(self):
         self.tick_count += 1
         if self.tick_count % max(1, int(self.cfg.get("tick_delay", 30))) != 0:
             return
+        self._drain_dc_deferred()
         if getattr(self, "command_only", False):
             try:
                 self.dispatch_orders()
