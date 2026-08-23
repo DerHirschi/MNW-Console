@@ -5,6 +5,31 @@ Alle nennenswerten Änderungen dieses Teilprojekts. Format angelehnt an
 
 ## [Unreleased]
 
+### 2026-08-23 — ai_tactical: Mast-Schema im OWN-SHIP-Rahmen
+
+**Neu**
+
+- Segeltuch-Schema mit 6 Mast-Slots: Balken starten in der Rumpffläche und
+  ragen nach oben; Füllhöhe = Ausfahrlänge bei **fester 5-m-Skala** (max.
+  4 Zeilen), exakte Ausrichtung auf die Slot-Zentren (berechnete Spalten,
+  kein Freihand-ASCII). Eingefahren = dimmer Stub, Raised-ohne-Höhe = Stub
+  + `?`-Label (nie fabrizierte Werte).
+- Snorkel-Kopf als kleines Quadrat auf der Balkenspitze: grün bei
+  `snorkel_exposed` (über Wasser), dunkelblau (`blue_dim`, neues Style-Token)
+  unterwasser. Snorkel-Zeile darunter: Zustand (`down`/`up`/`up·exp`),
+  `HV` head valve, `HL` intake hole, `VV` intake volume, SCALE-Hinweis wenn
+  breit genug; kompakte Variante <44 Spalten.
+- Neue Frame-Felder: `player.masts[]` (`id/type/status/height`, IDs aus
+  `mast_ids` mit Fallback-Scan 0–5) plus `snorkel_head_valve`,
+  `snorkel_intake_hole`, `snorkel_intake_volume`.
+- Renderer `render_mast_schema(frame, width)` als Pure Function; eingebunden
+  in rechte Spalte, gestapelten Modus und Text-/JSON-Ausgabe; Degrade auf
+  `[]` unter 25 Spalten.
+
+**Tests**: 10 neue (`TestMastSchema`) — Alignment, Füllzählung pro Spalte,
+Kopf-Farbwechsel, Labels/Readout, Schmalbreite, Integration aller drei
+Ausgabepfade. Suite: 63 grün.
+
 ### 2026-08-23 — ai_tactical: Live-Verifikationsrunde 2+3
 
 **Behoben**

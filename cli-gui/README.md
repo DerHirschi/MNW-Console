@@ -88,6 +88,21 @@ close threat/detected-you, yellow = medium range/caution, cyan = fresh orders,
 magenta = weapon threats, blue = own-ship instrument values. Degrades to plain
 mono emphasis with `--no-color`.
 
+### Mast schematic (OWN SHIP frame)
+
+Below the instrument lines the OWN SHIP box renders the sail as a 6-slot
+rectangle; each mast is a bar that starts inside the hull and rises above the
+sail by its Ausfahrlänge at a **fixed 5 m scale** (4 fill rows max). Bars sit
+exactly on their slot centres; raised-but-unknown height shows only the hull
+stub with a `?` label. The snorkel bar carries a small head square: green when
+`snorkel_exposed` (head above the surface), dark blue while submerged. Under
+the drawing: per-slot type abbreviations (SNK/RAD1/P1/P2/C1/C2) and heights in
+metres (`-` = retracted), plus a snorkel readout line — state
+(`down`/`up`/`up · exposed`, colour-matched to the head), head valve, intake
+hole and intake volume, and a scale hint where width allows. The schema needs
+≥25 columns and disappears gracefully below that. Same renderer runs in the
+right-hand column layout, the stacked layout and `--json`/text mode.
+
 ### Refresh model
 
 Input is decoupled from polling: keys react within ~150 ms; the data poll runs on its

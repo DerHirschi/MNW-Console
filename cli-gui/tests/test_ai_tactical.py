@@ -56,7 +56,23 @@ def ship_state_fixture():
         "blackboard": {"_MergedContacts": "list(5)",
                        "_EnemySuspiciousContacts": "list(0)"},
         "systems": {"integrity_damage_ratio": 0.0, "ammo_offensive_ratio": 1.0,
-                    "ammo_defensive_ratio": 0.8, "towed_array": "Retracted"},
+                    "ammo_defensive_ratio": 0.8, "towed_array": "Retracted",
+                    "mast_ids": [0, 1, 2, 3, 4, 5],
+                    "mast_0_type": "Snorkel", "mast_0_status": "Raised",
+                    "mast_0_height": 4.256,
+                    "mast_1_type": "Radar1", "mast_1_status": "Raised",
+                    "mast_1_height": 2.568,
+                    "mast_2_type": "Photonics1", "mast_2_status": "Retracted",
+                    "mast_2_height": 0.0,
+                    "mast_3_type": "Photonics2", "mast_3_status": "Retracted",
+                    "mast_3_height": 0.0,
+                    "mast_4_type": "CommAntenna1", "mast_4_status": "Raised",
+                    "mast_4_height": 1.842,
+                    "mast_5_type": "CommAntenna2", "mast_5_status": "Retracted",
+                    "mast_5_height": 0.0,
+                    "snorkel_raised": True, "snorkel_exposed": False,
+                    "snorkel_head_valve": 0, "snorkel_intake_hole": 0.1,
+                    "snorkel_intake_volume": 0.0},
     }
 
 
@@ -677,6 +693,112 @@ class TestRound2Fixes(unittest.TestCase):
         flat = "".join(t for row in rows for t, _ in row)
         self.assertIn("POS", flat)
         self.assertIn("MAST", flat)
+
+
+class TestMastSchema(unittest.TestCase):
+    def _frame(self, **player_over):
+        frame = at.build_frame({"ship_state": ship_state_fixture(),
+                                "ai_state": ai_state_fixture(),
+                                "now": time.time()})
+        frame["player"].update(player_over)
+        return frame
+
+    def _text(self, rows):
+        return ["".join(t for t, _ in r) for r in rows]
+
+    def test_build_frame_masts_and_snorkel(self):
+        f = at.build_frame({"ship_state": ship_state_fixture(),
+                            "ai_state": ai_state_fixture(), "now": time.time()})
+        p = f["player"]
+        self.assertEqual(len(p["masts"]), 6)
+        self.assertEqual(p["masts"][0]["type"], "Snorkel")
+        self.assertEqual(p["masts"][0]["height"], 4.256)
+        self.assertEqual(p["masts_up"], 3)
+        self.assertEqual(p["snorkel_head_valve"], 0)
+        self.assertAlmostEqual(p["snorkel_intake_hole"], 0.1)
+
+    def test_build_frame_mast_id_fallback_scan(self):
+        ss = ship_state_fixture()
+        del ss["systems"]["mast_ids"]
+        f = at.build_frame({"ship_state": ss, "ai_state": ai_state_fixture(),
+                            "now": time.time()})
+        self.assertEqual([m["id"] for m in f["player"]["masts"]],
+                         [0, 1, 2, 3, 4, 5])
+
+    def test_fill_rows_fixed_scale(self):
+        R = at._mast_fill_rows
+        self.assertEqual(R({"status": "Raised", "height": 4.256}), 3)
+        self.assertEqual(R({"status": "Raised", "height": 2.568}), 2)
+        self.assertEqual(R({"status": "Raised", "height": 1.842}), 1)
+        self.assertEqual(R({"status": "Retracted", "height": 4.256}), 0)
+        self.assertEqual(R({"status": "Raised", "height": None}), 0)
+        self.assertEqual(R({"status": "Raised", "height": 99.0}), 4)
+
+    def test_bars_sit_on_slot_centres(self):
+        txt = self._text(at.render_mast_schema(self._frame(), 32))
+        top_i = next(i for i, t in enumerate(txt) if t.startswith("┌"))
+        mid = txt[top_i + 1]
+        centers = [i for i, ch in enumerate(mid) if ch in "█░"]
+        above = txt[:top_i]
+        for row in above:                      # bars over slot centres only
+            for i, ch in enumerate(row):
+                if ch == "█":
+                    self.assertIn(i, centers)
+        for i, ch in enumerate(mid):           # hull stubs continue upward
+            if ch == "█":
+                self.assertTrue(any(r[i] == "█" for r in above),
+                                "stub col %d has no bar above" % i)
+
+    def test_fill_counts_per_column(self):
+        txt = self._text(at.render_mast_schema(self._frame(), 32))
+        top_i = next(i for i, t in enumerate(txt) if t.startswith("┌"))
+        mid = txt[top_i + 1]
+        above = txt[:top_i]
+        cols = [i for i, ch in enumerate(mid) if ch == "█"]
+        self.assertEqual(len(cols), 3)         # snorkel, radar, comm1 raised
+        fills = {c: sum(1 for r in above if r[c] == "█") for c in cols}
+        self.assertEqual(list(fills.values()), [3, 2, 1])   # 4.26 / 2.57 / 1.84
+
+    def test_snorkel_head_colour_by_exposure(self):
+        rows = at.render_mast_schema(self._frame(), 32)
+        head = [(t, s) for r in rows for t, s in r if t == "▪"]
+        self.assertEqual(len(head), 1)
+        self.assertEqual(head[0][1], "blue_dim")       # fixture: submerged
+        rows = at.render_mast_schema(self._frame(snorkel_exposed=True), 32)
+        head = [(t, s) for r in rows for t, s in r if t == "▪"]
+        self.assertEqual(head[0][1], "green")
+
+    def test_labels_heights_and_snorkel_readout(self):
+        txt = "\n".join(self._text(at.render_mast_schema(self._frame(), 32)))
+        for abbr in ("SNK", "RAD1", "P1", "P2", "C1", "C2"):
+            self.assertIn(abbr, txt)
+        for val in ("4.3", "2.6", "1.8", "-"):
+            self.assertIn(val, txt)
+        self.assertIn("SNK up ", txt)          # raised, not exposed
+        self.assertIn("HV0", txt)
+        self.assertIn("HL0.1", txt)
+        self.assertIn("VV0", txt)
+
+    def test_verbose_mode_and_scale_hint(self):
+        txt = self._text(at.render_mast_schema(self._frame(), 60))[-1]
+        self.assertTrue(txt.startswith("SNORKEL up "))
+        self.assertIn("INT-HOLE", txt)
+        self.assertIn("INT-VOL", txt)
+        self.assertIn("SCALE 0-5m", txt)
+
+    def test_narrow_and_empty_degrade(self):
+        f = self._frame()
+        self.assertEqual(at.render_mast_schema(f, 24), [])
+        self.assertGreaterEqual(len(at.render_mast_schema(f, 25)), 9)
+        empty = {"player": {}}
+        self.assertEqual(at.render_mast_schema(empty, 40), [])
+
+    def test_integration_side_stacked_textmode(self):
+        f = self._frame()
+        side = self._text(at.render_own_ship_side(f))
+        self.assertTrue(any(t.startswith("┌") for t in side))
+        lines = self._text(at.render_frame_lines(f, 90))
+        self.assertTrue(any(t.startswith("┌") for t in lines))
 
 
 if __name__ == "__main__":

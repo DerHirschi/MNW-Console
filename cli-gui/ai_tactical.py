@@ -558,13 +558,28 @@ def build_frame(data):
     clock = ship.get("clock") or {}
     systems = ship.get("systems") or {}
 
-    def _mast_stats():
-        mids = systems.get("mast_ids") or [i for i in range(6)
-                                           if systems.get("mast_%d_type" % i)]
-        up = [i for i in mids if systems.get("mast_%s_status" % i) == "Raised"]
-        return len(up), len(mids)
+    def _masts():
+        """Per-mast state for the schematic; ids from probe or key scan 0-5."""
+        mids = systems.get("mast_ids")
+        if not isinstance(mids, list):
+            mids = [i for i in range(6) if systems.get("mast_%d_type" % i)]
+        out = []
+        for i in mids:
+            try:
+                mid = int(i)
+            except (TypeError, ValueError):
+                continue
+            out.append({
+                "id": mid,
+                "type": systems.get("mast_%d_type" % mid),
+                "status": systems.get("mast_%d_status" % mid),
+                "height": _num(systems.get("mast_%d_height" % mid)),
+            })
+        return out
 
-    masts_up, masts_total = _mast_stats()
+    masts = _masts()
+    masts_up = sum(1 for m in masts if m["status"] == "Raised")
+    masts_total = len(masts)
     frame = {
         "now": now,
         "interval": data.get("interval", 5.0),
@@ -629,8 +644,12 @@ def build_frame(data):
             "towed": systems.get("towed_array"),
             "masts_up": masts_up,
             "masts_total": masts_total,
+            "masts": masts,
             "snorkel_raised": systems.get("snorkel_raised"),
             "snorkel_exposed": systems.get("snorkel_exposed"),
+            "snorkel_head_valve": _num(systems.get("snorkel_head_valve")),
+            "snorkel_intake_hole": _num(systems.get("snorkel_intake_hole")),
+            "snorkel_intake_volume": _num(systems.get("snorkel_intake_volume")),
         },
         "orders_pending": sorted((data.get("pending") or {}).keys()),
         "read_only": data.get("read_only", False),
@@ -902,6 +921,155 @@ def render_own_ship_side(frame, box_w=34):
     rows.append(v("DMG", "%.0f%%  AMMO %s/%s" % ((dmg or 0.0) * 100.0,
                                                  _fmt(p.get("ammo_off"), 2),
                                                  _fmt(p.get("ammo_def"), 2)), dmg_style))
+    rows += render_mast_schema(frame, box_w - 2)
+    return rows
+
+
+# Mast schematic: fixed 5 m scale, up to 4 fill rows above the sail box.
+_MAST_SCALE_M = 5.0
+_MAST_ROWS_ABOVE = 4
+
+_MAST_PREFIX = (("snorkel", "SNK"), ("radar", "RAD"),
+                ("photonics", "P"), ("commantenna", "C"))
+
+
+def _mast_abbr(m, counters):
+    """Snorkel->SNK, Radar1->RAD, Photonics2->P2, CommAntenna1->C1."""
+    t = str(m.get("type") or "").lower()
+    for pre, ab in _MAST_PREFIX:
+        if t.startswith(pre):
+            digits = "".join(ch for ch in t if ch.isdigit())
+            if digits:
+                return ab + digits[0]
+            if len(ab) > 1:
+                return ab
+            counters[ab] = counters.get(ab, 0) + 1
+            return "%s%d" % (ab, counters[ab])
+    return "M%s" % (m.get("id"),)
+
+
+def _mast_fill_rows(m):
+    """Fill rows above the sail for one mast (0 = retracted/unknown)."""
+    if m.get("status") != "Raised":
+        return 0
+    h = _num(m.get("height"))
+    if h is None or h <= 0:
+        return 0
+    return max(1, min(_MAST_ROWS_ABOVE,
+                      int(round(h / _MAST_SCALE_M * _MAST_ROWS_ABOVE))))
+
+
+def render_mast_schema(frame, width):
+    """Sail schematic: one fill bar per mast, sitting exactly on its slot
+    centre; bars start inside the sail area and rise by Ausfahrlänge at a
+    fixed 5 m scale. Snorkel head marker turns green above the surface.
+    Pure function; [] when the width cannot fit the narrowest drawing."""
+    p = frame.get("player") or {}
+    masts = p.get("masts") or []
+    if not masts:
+        return []
+    cw = None
+    for cand in (5, 4, 3):
+        if cand * 6 + 7 <= width:
+            cw = cand
+            break
+    if cw is None:
+        return []
+    n = min(len(masts), 6)
+    centers = [1 + i * (cw + 1) + cw // 2 for i in range(n)]
+    total_w = n * (cw + 1) + 1
+
+    def merge(chars):
+        segs, cur, buf = [], None, ""
+        for ch, st in chars:
+            s = None if ch == " " else st
+            if buf and s == cur:
+                buf += ch
+            else:
+                if buf:
+                    segs.append((buf, cur))
+                cur, buf = s, ch
+        if buf:
+            segs.append((buf, cur))
+        return segs
+
+    def grid_row(extra=None):
+        row = [(" ", None)] * total_w
+        for col, cell in (extra or {}).items():
+            if 0 <= col < total_w:
+                row[col] = cell
+        return row
+
+    fills = [_mast_fill_rows(m) for m in masts[:n]]
+    snork_idx = next((i for i, m in enumerate(masts[:n])
+                      if str(m.get("type") or "").lower().startswith("snorkel")),
+                     None)
+    exposed = bool(p.get("snorkel_exposed"))
+    head_row = (_MAST_ROWS_ABOVE - fills[snork_idx] - 1) \
+        if snork_idx is not None and fills[snork_idx] > 0 else -1
+
+    # bar area: blocks stack upward from the sail top edge; the snorkel head
+    # square rides one row above the snorkel bar's topmost block
+    rows = []
+    for j in range(_MAST_ROWS_ABOVE):
+        cells = {}
+        for i in range(n):
+            if (_MAST_ROWS_ABOVE - 1 - j) < fills[i]:
+                cells[centers[i]] = ("█", "bright")
+        if j == head_row:
+            cells[centers[snork_idx]] = ("▪",
+                                         "green" if exposed else "blue_dim")
+        rows.append(merge(grid_row(cells)))
+
+    # sail box top edge / interior with the in-hull bar stubs / bottom edge
+    rows.append([_seg("┌" + "┬".join(["─" * cw] * n) + "┐")])
+    mid = grid_row({centers[i]: (("█", "bright")
+                                 if masts[i].get("status") == "Raised"
+                                 else ("░", "dim")) for i in range(n)})
+    for b in range(n + 1):
+        mid[b * (cw + 1)] = ("│", None)
+    rows.append(merge(mid))
+    rows.append([_seg("└" + "┴".join(["─" * cw] * n) + "┘")])
+
+    counters = {}
+    abbrs = [_mast_abbr(m, counters) for m in masts[:n]]
+
+    def label_row(texts, style):
+        cells = {}
+        for i in range(n):
+            txt = texts[i][:cw]
+            start = centers[i] - len(txt) // 2
+            for k, ch in enumerate(txt):
+                cells[start + k] = (ch, style)
+        return merge(grid_row(cells))
+
+    rows.append(label_row(abbrs, "dim"))
+    heights = []
+    for m in masts[:n]:
+        h = _num(m.get("height"))
+        heights.append("?" if h is None else ("-" if h <= 0 else _fmt(h, 1)))
+    rows.append(label_row(heights, "blue"))
+
+    sn_up = p.get("snorkel_raised")
+    sn_state = "?" if sn_up is None else \
+        ("up·exp" if p.get("snorkel_exposed") else ("up" if sn_up else "down"))
+    sn_style = "green" if (sn_up and p.get("snorkel_exposed")) else \
+        ("cyan" if sn_up else "dim")
+    compact = width < 44
+    srow = [_seg("SNK " if compact else "SNORKEL ", "dim"),
+            _seg(sn_state, sn_style)]
+    fmts = [(" HV", 0), (" HL", 2), (" VV", 2)] if compact else \
+           [("   HV ", 0), ("   INT-HOLE ", 2), ("   INT-VOL ", 2)]
+    keys = ("snorkel_head_valve", "snorkel_intake_hole",
+            "snorkel_intake_volume")
+    for (lab, dig), key in zip(fmts, keys):
+        srow.append(_seg(lab, "dim"))
+        srow.append(_seg(_fmt(p.get(key), dig), "blue"))
+    tail_len = len("   SCALE 0-%dm" % int(_MAST_SCALE_M))
+    cur_len = sum(len(t) for t, _ in srow)
+    if cur_len + tail_len <= width:
+        srow.append(_seg("   SCALE 0-%dm" % int(_MAST_SCALE_M), "dim"))
+    rows.append(srow)
     return rows
 
 
@@ -966,6 +1134,7 @@ def render_frame_lines(frame, width, sel=0, detail=False):
         " | %s RO" % h["mode"].upper() if frame.get("read_only") else "")
     lines = [[_seg(head[:width], "hdr")]]
     lines += render_own_ship_panel(frame, width)
+    lines += render_mast_schema(frame, width)
     if not frame.get("elements"):
         lines.append([_seg("-- no AI elements detected --", "dim")])
     else:
@@ -1435,6 +1604,7 @@ _PAIRS = {
 #   cyan              fresh orders / active links
 #   magenta           weapon threats (torpedo/missile/dipping)
 #   blue              own-ship instrument values
+#   blue_dim          submerged / inactive water-related markers
 #   white             neutral highlight
 _STYLES = {
     "green": ("green", 0),
@@ -1447,6 +1617,7 @@ _STYLES = {
     "cyan": ("cyan", 0),
     "magenta": ("magenta", curses.A_BOLD),
     "blue": ("blue", curses.A_BOLD),
+    "blue_dim": ("blue", 0),
     "white": ("white", 0),
 }
 
@@ -1558,6 +1729,7 @@ def run_curses(scr, collector, args):
 
         if not side_w:
             own_rows = render_own_ship_panel(fr, width)
+            own_rows += render_mast_schema(fr, width - 2)
             iy, ix, iw = _draw_box(scr, y, width, len(own_rows) + 2,
                                    "OWN SHIP", colors)
             _draw_rows(scr, own_rows, iy, iw, colors, x0=ix)

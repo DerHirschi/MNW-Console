@@ -1,5 +1,44 @@
 # Changelog
 
+## v2.3 (2026-08-23) — cli-gui: mast schematic with snorkel readout
+
+Sync cli-gui/ from `masto/MNW-Tool/cli-gui/`. Adds a sail-mast schematic to
+the OWN SHIP frame with per-mast fill bars, snorkel head marker, and readout
+line (state, head valve, intake hole/volume, scale hint). 10 new tests.
+
+### ai_tactical.py
+
+- **Mast schematic** — `render_mast_schema(frame, width)`: 6-slot sail drawing
+  with fill bars rising from hull at a fixed 5 m scale (max 4 rows). Bars sit
+  exactly on slot centres; retracted masts show a dim hull stub, raised-but-
+  unknown height shows stub + `?` label. Snorkel bar carries a small head
+  square: green when `snorkel_exposed` (above surface), dark blue (`blue_dim`)
+  while submerged. Below the drawing: type abbreviations (SNK/RAD1/P1/P2/C1/C2)
+  and heights in metres, plus snorkel readout line (state, HV, HL, VV, scale
+  hint). Degrades to `[]` below 25 columns.
+- **New frame fields** — `player.masts[]` (`id/type/status/height`), plus
+  `snorkel_head_valve`, `snorkel_intake_hole`, `snorkel_intake_volume`.
+- **`blue_dim` style token** — new curses attribute for submerged/inactive
+  water-related markers.
+- **Renderer integration** — wired into right-hand column, stacked layout,
+  and text/JSON output paths.
+
+### Tests
+
+- 10 new `TestMastSchema` cases: alignment, fill counts per column, snorkel
+  head colour by exposure, labels/readout, narrow/empty degrade, integration
+  with side-stacked + text mode. Suite: 63 green.
+
+### cli-gui/README.md
+
+- Added mast schematic section with layout description.
+
+### cli-gui/CHANGELOG.md
+
+- Added entry for mast schematic feature.
+
+---
+
 ## v2.2 (2026-08-23) — Rotating section queue + background writer
 
 Full sync with `masto/MNW-Tool/ship-probe/`. New `collect_mode="queue"` replaces
