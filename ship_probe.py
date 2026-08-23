@@ -51,7 +51,7 @@ _DEFAULTS = {
     "target_element_id": 0,
     "max_contacts": 50,
     "max_commands_per_cycle": 10,
-    "allow_commands": ["helm", "planes", "sd-dump", "tanks", "env", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc"],
+    "allow_commands": ["helm", "planes", "sd-dump", "tanks", "env", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc", "ai-state"],
     "resolve_positions": False,
     "state_every": 3,
     "read_identity": True,
@@ -1553,7 +1553,7 @@ class _Probe(object):
         gate probe proved access_* ok on the PLAYER controller, and the live
         run confirmed Access[SonarSystem]() = ok. The player Virginia is
         sonar-equipped, so SonarSystem is guaranteed present -> Access[] is
-        safe. The old _Components field scan is dead (that field is fdPrivate,
+        safe. The old _Components field scan is dead (that field is private,
         invisible to pythonnet getattr — same for the nested .Controller and
         .Hub, which have no such fields exposed at all). Returns the
         SonarSystem instance or None."""
@@ -2442,13 +2442,13 @@ class _Probe(object):
     # command dispatch (CONTROL side)
     # ---------------------------------------------------------------
 
-    _ACTIONS = ("helm", "planes", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "sd-dump", "tanks", "env", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc")
+    _ACTIONS = ("helm", "planes", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "sd-dump", "tanks", "env", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc", "ai-state")
 
     # Commands whose native access is ELEMENT-scoped (target a specific
     # element id in the CALLING host's interpreter namespace). Command-only
     # probes (one per element script that resolves the player) may run these;
     # all other actions are executed ONLY by the lock-holding full probe.
-    _ELEMENT_ACTIONS = ("ai-attack", "ns-dump", "asg", "ai-contacts")
+    _ELEMENT_ACTIONS = ("ai-attack", "ns-dump", "asg", "ai-contacts", "ai-state")
 
     @staticmethod
     def _cmdid_of(c):
@@ -5672,6 +5672,90 @@ class _Probe(object):
         self.emit("asg done")
         return lines
 
+    def do_ai_state(self, cmd):
+        """Gezielte State-Leseoperation fuer ein einzelnes AI-Element.
+        Liest Identity/Position/Heading/Speed/Assignment/Contacts aus der
+        Blackboard-Namespace /<id>/. Nur Feldzugriffe (keine Methoden),
+        alles _try-guarded. Command-only Hosts (Helo/Sub) koennen diese
+        Action ausfuehren."""
+        lines = []
+        try:
+            nid = int(cmd["id"])
+        except Exception:
+            raise RuntimeError("ai-state ID")
+        lines.append("target element id=%d" % nid)
+        kv = self._element_namespace(nid)
+        if kv is None:
+            self.emit("ai-state cp0x: no /%d/ namespace on this host - skipping" % nid)
+            return None
+        self.emit("ai-state cp0a: namespace ok (%d keys)" % len(kv))
+        # identity from _Information or _SelfInfo
+        info = kv.get("_Information")
+        if info is None:
+            info = kv.get("_SelfInfo")
+        if info is not None:
+            for name, fn in (
+                ("name", lambda: str(info.ElementName)),
+                ("category", lambda: str(info.Category)),
+            ):
+                r = _try(fn)
+                if r[0] == "ok":
+                    lines.append("%s=%s" % (name, r[1]))
+                else:
+                    lines.append("%s_err=%s" % (name, _desc(r[1], 60)))
+        # position / heading / speed from _Navigation
+        nav = kv.get("_Navigation")
+        if nav is not None:
+            r = _try(lambda: nav.INS.GeoCoordinates)
+            if r[0] == "ok":
+                ll = _coord_to_ll(r[1])
+                if ll is not None:
+                    lines.append("lat=%s" % ll[0])
+                    lines.append("lon=%s" % ll[1])
+                else:
+                    ll2 = self._merc_to_ll(r[1])
+                    if ll2 is not None:
+                        lines.append("lat=%s" % ll2[0])
+                        lines.append("lon=%s" % ll2[1])
+            for name, attr in (
+                ("heading", "Heading"), ("true_heading", "TrueHeading"),
+                ("speed", "ForwardSpeed"), ("true_speed", "TrueForwardSpeed"),
+            ):
+                r = _try(lambda attr=attr: getattr(nav.INS, attr))
+                if r[0] == "ok":
+                    lines.append("%s=%s" % (name, _safe_num(r[1])))
+            r = _try(lambda: nav.DepthGauge.Elevation)
+            if r[0] == "ok":
+                lines.append("depth=%s" % _safe_num(r[1]))
+        # assignment
+        asg_id = kv.get("_CurrentAssignmentID")
+        if asg_id is not None:
+            r = _try(lambda: int(asg_id))
+            if r[0] == "ok":
+                lines.append("assignment_id=%d" % r[1])
+        # EOT orders
+        for name, key in (("current_eot", "_CurrentEOTOrder"),
+                          ("ordered_eot", "_OrderedEOTOrder")):
+            v = kv.get(key)
+            if v is not None:
+                r = _try(lambda v=v: str(v))
+                if r[0] == "ok":
+                    lines.append("%s=%s" % (name, r[1]))
+        # action prep flag
+        prep = kv.get("_ActionPrepComplete")
+        if prep is not None:
+            r = _try(lambda: bool(prep))
+            if r[0] == "ok":
+                lines.append("action_prep_complete=%s" % r[1])
+        # contact count only (track access = freeze risk)
+        cmgr = kv.get("_ContactManager")
+        if cmgr is not None:
+            r = _try(lambda: cmgr.Count)
+            if r[0] == "ok":
+                lines.append("contact_count=%d" % int(r[1]))
+        self.emit("ai-state done: %d fields" % (len(lines) - 1))
+        return lines
+
     def do_ai_attack(self, cmd):
         lines = []
         try:
@@ -5978,7 +6062,7 @@ class _Probe(object):
         if transit_cls is None:
             raise RuntimeError("Transit class unavailable")
         # Transit ctor takes (who, dest, TransitSpeed enum), not a float.
-        # Verified enum members (mnw.scenarios.dll .TransitSpeed):
+        # Verified enum members:
         #   Silent, Cruise, High   (NO "Low" — that was the pre-verify bug).
         ts_cls = self.g("TransitSpeed")
         if ts_cls is None:
@@ -6279,16 +6363,20 @@ class _Probe(object):
         self.emit("active_mission: %s" % ("ok" if am is not None else "None"))
         ck = self.clock_manager()
         self.emit("clock_manager: %s" % ("ok" if ck is not None else "None"))
+        self._warmup_clr()
+        if getattr(self, "command_only", False):
+            try:
+                self.do_ns_dump({})
+            except Exception as e:
+                self.emit("ns-dump (command-only init) failed: %s" % _desc(e, 80))
+            self.emit("SHIP PROBE READY (command-only mode: no state writes, no discovery)")
+            return
         info = self.host_get("_Information")
         if info is None:
             self.emit("no _Information in host - releasing lock for a real element script")
             raise RuntimeError("no _Information in host (contextless module)")
         det = self.detect_player()
         self.emit("player detection: %s" % json.dumps(det))
-        self._warmup_clr()
-        if getattr(self, "command_only", False):
-            self.emit("SHIP PROBE READY (command-only mode: no state writes, no discovery)")
-            return
         self.discovery_run()
         self.api_probe_run()
         self.emit("SHIP PROBE READY (state writes for player only)")
@@ -6446,7 +6534,34 @@ def ship_probe_tick(host=None):
     if not any(k in host for k in _HOST_KEYS):
         # contextless module (operational_ai.py or similar): never take the
         # lock here - a real element script ticks right after and must win.
-        _gate_reject_log(host, "no-host-keys", before_keys=True)
+        # But if the blackboard has keys, allow command-only mode so that
+        # ns-dump and ai-state can read THIS host's element namespace.
+        _has_bb = False
+        try:
+            from pybt.bb.blackboard import Blackboard
+            _has_bb = bool(Blackboard.storage)
+        except Exception:
+            pass
+        if not _has_bb:
+            _gate_reject_log(host, "no-host-keys", before_keys=True)
+            return
+        # contextless host with blackboard → command-only, no lock
+        _gate_reject_log(host, "no-host-keys-command-only", before_keys=True)
+        try:
+            _HOST = host
+            _probe = _Probe(_load_config())
+            _probe.command_only = True
+            _probe.begin()
+            _debug_console("ship_probe: started (command-only contextless), host=%s" % (
+                host.get("__name__", "?") if host is not None else "-"))
+        except Exception:
+            _debug_console("ship_probe: init FAILED (command-only contextless)")
+            _probe = None
+            return
+        try:
+            _probe.tick()
+        except Exception:
+            pass
         return
     # Gate: probe targets the player via cm.Player.Controller. Every element
     # script that can resolve the player may run a probe. The LOCK decides who

@@ -30,7 +30,9 @@
     "tracker",
     "masts",
     "explore",
-    "tracker-new"
+    "tracker-new",
+    "dc",
+    "ai-state"
   ],
   "resolve_positions": false,
   "state_every": 3,

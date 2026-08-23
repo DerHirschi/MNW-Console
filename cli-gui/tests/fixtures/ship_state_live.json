@@ -1,0 +1,46 @@
+{
+  "ts": "2026-08-22 18:32:34",
+  "identity": {"name": "(Player) Virginia B3", "country": 236, "category": "Submarine", "id": 9},
+  "player": {"player_id": 9, "is_player": true, "source": "CoordinatesManager.Player", "id": 9},
+  "mission": {"active": true, "name": "AI Attack Test", "operation": "ASW",
+              "datetime": "2029/02/15 12:00:00", "tension": "Peace"},
+  "clock": {"time": "2/15/2029 1:12:59 PM", "scale": 1},
+  "navigation": {
+    "lat_lon": [63.4979, 5.9013],
+    "heading": 82.76, "true_heading": 83.1,
+    "speed": 1.62, "true_speed": 1.6,
+    "depth": 16.97, "altitude": 120.4, "bottom_range": 137.4,
+    "_currentcourse": 82.76, "_orderedcourse": 45.0,
+    "_currenteotorder": "Stop", "_orderedeotorder": "Stop",
+    "_currentdepth": 16.97, "_ordereddepth": 17.07, "_currentrpm": 0.0
+  },
+  "blackboard": {
+    "_MergedContacts": "list(5)",
+    "_EnemySuspiciousContacts": "list(0)",
+    "_CurrentTensionLevel": "Peace",
+    "_WaypointIterator": 0
+  },
+  "contacts": {
+    "count": 1,
+    "tracks": [
+      {"prefix": "mnw.Core.ContactTools+ContactType.Sonar",
+       "elevation": NaN, "speed": NaN, "rcpa": NaN, "course": NaN,
+       "bearing_rate": 0.93, "relative_bearing": 167.73, "bearing": 89.44,
+       "identity": "mnw.Core.ContactTools+StandardIdentity.U...",
+       "id": "0", "tcpa": NaN, "range": 10056.84,
+       "category": "mnw.Core.ContactTools+CategoryID.Air"}
+    ]
+  },
+  "sonar": {
+    "count": 1,
+    "tracks": [
+      {"id": "S1", "bearing": 89.44, "range": null, "sensor": "LAB", "sensors": []}
+    ]
+  },
+  "systems": {
+    "integrity_damage_ratio": 0.0,
+    "ammo_offensive_ratio": 1.0,
+    "ammo_defensive_ratio": 1.0,
+    "towed_array": "Retracted"
+  }
+}

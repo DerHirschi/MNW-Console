@@ -1,0 +1,32 @@
+{
+  "results": [
+    {"cmdid": 41, "action": "detected", "ts": "18:29:58",
+     "result": "DETECTED elements: 16",
+     "detail": [
+       "detected: scanning ['0', '13', '16', '17']",
+       "detected: player at lat=63.4979 lon=5.9013",
+       "track probe: element 0 has NO contacts in _ContactManager",
+       "track probe: NO contact on player (checked 5 of 5 contacts)",
+       "track probe: HIT contact on player, range=2205.4 m (id 1)",
+       "DETECTED by element 13 (range 17456 m, contact id 3, 5 contacts)",
+       "DETECTED by element 16 (range 2205 m, contact id 1, 6 contacts)",
+       "DETECTED elements: 13, 16"
+     ]},
+    {"cmdid": 44, "action": "asg", "ts": "18:30:20",
+     "result": "ok",
+     "detail": [
+       "asg: assignment probe",
+       "target element id=18",
+       "assignment_id=-1",
+       "action_prep=True",
+       "current_altitude=804.2",
+       "dipping_engaged=False",
+       "throttle=0.85",
+       "rpm=0",
+       "_DippingEngaged present",
+       "ai_datalink.InboxLength=0",
+       "ammunition.OffensiveCombatPowerRatio=1.0",
+       "ammunition.DefensiveCombatPowerRatio=0.75"
+     ]}
+  ]
+}

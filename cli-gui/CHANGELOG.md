@@ -1,0 +1,73 @@
+# Changelog — cli-gui ("Pilot-Station")
+
+Alle nennenswerten Änderungen dieses Teilprojekts. Format angelehnt an
+[Keep a Changelog](https://keepachangelog.com/de/1.1.0/).
+
+## [Unreleased]
+
+### 2026-08-23 — ai_tactical: Live-Verifikationsrunde 2+3
+
+**Behoben**
+
+- **Kontakt #13 verschwand aus der Tabelle:** `ship_state.player.id` zeigt live
+  auf ein fremdes Element (13 = feindlicher DDG), während `player_id`/`identity.id`
+  korrekt 9 liefern. `own_element_ids()` behandelt `player_id` jetzt als
+  autoritativ; Sekundärquellen zählen nur bei Übereinstimmung.
+- **Element 0 (contextless Host-Modul)** erzeugte eine Junk-Zeile und verdrängte
+  echte Kontakte aus dem Sichtfenster; es wird jetzt überall gefiltert
+  (Tabelle, asg/ext-Rotation, Presence-Quelle).
+- **asg/ext-Rotation rotierte nie:** Result-Timestamps sind `HH:MM:SS`-only,
+  `parse_ts` lieferte `None` → immer derselbe Kandidat (live ~90× `asg id=0`).
+  Rotation-Alter kommt jetzt vom Ingest-Wallclock.
+- **cmdid-Wiederverwendung:** Der Probe leert `ship_orders.json` nach der
+  Verarbeitung; cmdids starteten wieder bei 0 und kollidierten mit Pending-
+  Zwecken. Collector-seitiger Monotonie-Floor (`send_commands(..., floor=)`).
+- **Scroll-Fenster** folgt der Auswahl mit der echten sichtbaren Zeilenzahl
+  statt `max(3, n)`.
+- **THREATS-Frame ragte in die Own-Ship-Spalte:** THREATS-/DETAIL-Boxen werden
+  im Side-by-Side-Modus auf die linke Spalte begrenzt; Threat-Bar wrappt jetzt
+  auf schmale Breiten (`_wrap_segs`, granulare Segmente); DATA-Ages nur noch
+  im Footer.
+
+**Hinzugefügt**
+
+- Geschwindigkeiten in **Knoten**: Probe liefert m/s (Unity-Konvention); alle
+  `kt`-gelabelten Anzeigen gehen durch `_kt()` (×1.94384) — KI-Tabelle,
+  Detail, OWN SHIP (Panel + Seitenspalte), AI-Kontakte.
+- **Detected-Automatik**: Basiskadenz `--detect-interval` (min 10 s, default
+  10 s) plus Event-Trigger bei Signaturwechsel eines Elements
+  (Range/Kurs/Speed/EOT/Assignment/Orders/Prep/Kontaktzahl).
+- **Ghost-Discovery**: automatischer `ns-dump` beim Kaltstart, Wiederholung
+  alle 10 Zyklen bis ein Helo/Sub-Style im Probe-Log auftaucht.
+- **Layout ≥100 Spalten**: OWN SHIP als rechte Instrumentspalte
+  (`render_own_ship_side`); darunter weiter gestapelt.
+- **Dunkelgrün heller**: `A_DIM` entfernt, Green-Brightening via `init_color`
+  wo das Terminal Farbdefinitionen erlaubt.
+- **NDJSON-Stream**: `--json --count N>1` gibt einen Frame pro Poll als
+  Zeile aus (Automation/tests ohne TTY).
+- `BRIEF_ns_dump_multihost.md` für den ship-probe-Agenten (Multi-Host-
+  Antwort des ns-dump + deterministische Element-Enumeration).
+
+**Erkenntnisse (live, remote Mission "AI Attack Test")**
+
+- `detected` läuft automatisch; #17 trackt den Spieler (rot, YES + Range).
+- ns-dump antwortet aktuell nur vom Player/FULL-Host (`/0/ general`,
+  `/13/`,`/16/`,`/17/` ship) — Helo/Sub-Zeilen bleiben aus; Analyse +
+  Abnahmekriterien im Brief oben. 154 Alt-`asg id=0` wurden manuell aus der
+  Remote-Order-Queue entfernt.
+
+### 2026-08-22 — ai_tactical: initiale curses-TUI
+
+- `ai_tactical.py`: htop-artige TUI über dem Dateiprotokoll; Merge aller
+  KI-Quellen (`ai_state.json`, `detected`/`asg`/`ai-contacts`-Results,
+  ns-Style-Ghosts, optionale `datalink_presence.json`) in eine Tabelle.
+- Panels: OWN SHIP, AI CONTACTS (scrollbar), THREATS / DETAIL #id (TAB),
+  Footer mit Poll-/Data-Ages; ACS-Rahmen, grüne Phosphor-Basis mit
+  semantischen Akzentfarben (rot/gelb/cyan/magenta/blau), `c` toggle,
+  `--no-color` Mono-Degrade.
+- Eingabe entkoppelt vom Pollen (~150 ms Tastatur-Latenz), Order-Queue gegen
+  Überlappung geschützt (`planes`-Refresh, `detected`, `asg`/`ai-state`-
+  Rotation TTL-basiert, `ns-dump`), `--read-only`.
+- Waffen-DB statisch (052D/054A/Akula/Z-9C/Virginia), NaN/Infinity-Sanitizer,
+  Narrow-Width-Degrade, `--json` Single-Frame.
+- Testsuite `tests/test_ai_tactical.py`; Fixtures aus Live-Daten.

@@ -1,0 +1,43 @@
+{
+  "elements": {
+    "13": {
+      "eid": 13,
+      "lat": 63.429802590081472,
+      "lon": 5.9771827269546112,
+      "host_eid": 13,
+      "category": "mnw.Core.ElementTools+ElementCategory.Ship",
+      "country": 183,
+      "ai_data_link": true,
+      "ts": "20:44:26"
+    },
+    "0": {
+      "eid": 0,
+      "host_eid": 0,
+      "category": "mnw.Core.ElementTools+ElementCategory.Ship",
+      "country": 0,
+      "ai_data_link": true,
+      "ts": "20:44:26"
+    },
+    "16": {
+      "eid": 16,
+      "lat": 63.506693778510474,
+      "lon": 5.9885810594329651,
+      "host_eid": 16,
+      "category": "mnw.Core.ElementTools+ElementCategory.Ship",
+      "country": 183,
+      "ai_data_link": true,
+      "ts": "20:44:26"
+    },
+    "17": {
+      "eid": 17,
+      "lat": 63.506877727390751,
+      "lon": 5.9874975554441736,
+      "host_eid": 17,
+      "category": "mnw.Core.ElementTools+ElementCategory.Ship",
+      "country": 183,
+      "ai_data_link": true,
+      "ts": "20:44:26"
+    }
+  },
+  "updated": "20:44:26"
+}
