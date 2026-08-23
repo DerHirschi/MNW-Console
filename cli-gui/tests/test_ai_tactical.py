@@ -949,5 +949,45 @@ class TestJsonSafe(unittest.TestCase):
         self.assertFalse(fr["sonar"]["tracks"])
 
 
+class TestProbeBusy(unittest.TestCase):
+    """PROBE BUSY banner when ship_state stalls (game tick holes)."""
+
+    def _frame(self, age):
+        fr = at.build_frame({"ship_state": ship_state_fixture()})
+        fr["ages"]["ship_state"] = age
+        return fr
+
+    def test_fresh_data_no_banner(self):
+        for age in (None, 0.0, 3.0, at.PROBE_BUSY_S):
+            lines = at.flatten(at.render_frame_lines(self._frame(age), 90))
+            self.assertFalse(any("PROBE BUSY" in l for l in lines), age)
+
+    def test_stalled_data_shows_banner_with_age(self):
+        lines = at.flatten(at.render_frame_lines(self._frame(22.4), 90))
+        busy = [l for l in lines if "PROBE BUSY" in l]
+        self.assertEqual(len(busy), 1)
+        self.assertIn("22s", busy[0])
+
+    def test_probe_busy_age_helper(self):
+        self.assertIsNone(at.probe_busy_age({"ages": {}}))
+        self.assertIsNone(at.probe_busy_age({"ages": {"ship_state": None}}))
+        self.assertIsNone(at.probe_busy_age(
+            {"ages": {"ship_state": at.PROBE_BUSY_S}}))
+        self.assertEqual(at.probe_busy_age(
+            {"ages": {"ship_state": 16.0}}), 16.0)
+
+    def test_banner_truncates_on_narrow_width(self):
+        lines = at.flatten(at.render_frame_lines(self._frame(30.0), 40))
+        busy = [l for l in lines if "PROBE BUSY" in l]
+        self.assertEqual(len(busy), 1)
+        self.assertLessEqual(len(busy[0]), 40)
+
+    def test_curses_draw_consumes_two_head_lines(self):
+        # draw() slices render_frame_lines[:2]; with a banner the second
+        # line must be the banner so the curses path shows it too
+        rows = at.render_frame_lines(self._frame(30.0), 80)
+        self.assertIn("PROBE BUSY", "".join(t for t, _ in rows[1]))
+
+
 if __name__ == "__main__":
     unittest.main()

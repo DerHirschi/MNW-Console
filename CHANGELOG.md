@@ -1,5 +1,49 @@
 # Changelog
 
+## v2.6 (2026-08-23) — Performance: mid-slice flush, slim sonar, AI dampening + PROBE BUSY
+
+Sync ship_probe + cli-gui from `masto/MNW-Tool/`. Three probe-side performance
+optimizations (tick-hole resilience, reduced C# call volume, AI write dampening)
+and a TUI-side PROBE BUSY banner.
+
+### ship_probe.py
+
+- **`_MID_SLICE_FLUSH_S = 2.0`** — while a section generator (sonar_arrays) is
+  mid-slice, flush a partial snapshot at least every 2 s so instruments never
+  black out. Injects a fresh clock reading into `_partial_state` and calls
+  `_flush_partial_state()`.
+- **`_AI_WRITE_MIN_S = 8.0`** — skip `read_ai_elements()` entirely when the last
+  write is younger than 8 s. Caches the last result and serves it; emits a
+  single skip note per window. Eliminates the bursty double-update within ~11 s
+  that was pure waste.
+- **`sonar_contacts_full` (default false)** — slim contact field set: bearing,
+  range, elevation, course, speed, signal, noise, doppler, category + nan (~9
+  C# reads per contact instead of 16). Exotic noise-split, database_id,
+  beam_type, id, relative_bearing stay behind the full flag.
+- **disasm references cleaned** (8 occurrences).
+
+### ship_probe_config.json
+
+- New field: `sonar_contacts_full` (default false).
+
+### cli-gui/ai_tactical.py
+
+- **PROBE BUSY banner** — amber `!! PROBE BUSY - no fresh data for Ns (game
+  tick stall) !!` under the header when `ship_state` age exceeds 15 s. Works
+  in curses and `--json`/text mode. `probe_busy_age(frame)` helper + `PROBE_BUSY_S = 15.0`.
+- **Curses draw uses 2 head lines** — banner + header both rendered at top.
+
+### cli-gui/tests/test_ai_tactical.py
+
+- 5 new `TestProbeBusy` cases: fresh=no banner, stalled=banner with age, helper
+  returns None/age, narrow truncation, curses 2-line head. Suite: 81 green.
+
+### cli-gui/CHANGELOG.md + README.md
+
+- PROBE BUSY banner documented.
+
+---
+
 ## v2.5 (2026-08-23) — ship_probe: multi-host delivery + stale-order pruning
 
 Sync ship_probe from `masto/MNW-Tool/`. Adds element-action grace window for

@@ -130,6 +130,12 @@ results record — so a TUI restart cannot deadlock the channel against the runn
 probe's in-RAM `last_cmdid` anymore (probe-side pruning tracked in
 `../ship-probe/BRIEF_orders_prune.md`). `--read-only` never writes `ship_orders.json`.
 
+When the game stops handing ticks to the probe (measured 7–12 s holes), all data
+freezes at once. The TUI then shows an amber `PROBE BUSY - no fresh data for Ns`
+banner under the header until `ship_state` refreshes again (> 15 s age triggers it).
+Probe-side mitigations (incremental writes while slicing, slim sonar contacts,
+AI write dampening) are specified as task 3 in `BRIEF_orders_prune.md`.
+
 The `ai-state` action is **deployed live** (see `../ship-probe/AGENTS.md`);
 helo/sub ghost rows fill in as the probes come back. If command-only hosts never
 answer the discovery `ns-dump`, that is a probe-side issue — tracked as task 2 in

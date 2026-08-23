@@ -1163,6 +1163,12 @@ def render_frame_lines(frame, width, sel=0, detail=False):
         " | PAUSED" if h.get("paused") else "",
         " | %s RO" % h["mode"].upper() if frame.get("read_only") else "")
     lines = [[_seg(head[:width], "hdr")]]
+    busy = probe_busy_age(frame)
+    if busy is not None:
+        txt = "!! PROBE BUSY - no fresh data for %ds (game tick stall) !!" \
+              % int(busy)
+        pad = max(0, (width - len(txt)) // 2)
+        lines.append([_seg((" " * pad + txt)[:width], "amber")])
     lines += render_own_ship_panel(frame, width)
     lines += render_mast_schema(frame, width)
     if not frame.get("elements"):
@@ -1765,6 +1771,17 @@ def _draw_box(scr, y0, width, height, title, colors=True, x0=0):
 
 HELP_LINE = " q quit | \u2191\u2193 sel | TAB detail | d detect | e ai-state | a contacts | r refresh | p pause | +/- intv | c color "
 
+PROBE_BUSY_S = 15.0
+
+
+def probe_busy_age(frame):
+    """Seconds since the last ship_state refresh when the probe looks stalled
+    (game tick holes), else None. Pure; safe on missing ages."""
+    age = (frame.get("ages") or {}).get("ship_state")
+    if age is None:
+        return None
+    return age if age > PROBE_BUSY_S else None
+
 DETAIL_ROWS_BASE = 7
 
 
@@ -1784,8 +1801,11 @@ def run_curses(scr, collector, args):
         width = min(w, 200)
         side_w = SIDE_BOX_W if width >= SIDE_MIN_WIDTH else 0
         left_w = width - side_w
-        head_txt = render_frame_lines(fr, left_w if side_w else width,
-                                      sel=sel, detail=False)[0]
+        head_lines = render_frame_lines(fr, left_w if side_w else width,
+                                        sel=sel, detail=False)[:2]
+
+        _draw_rows(scr, head_lines, 0, width, colors)
+        y = len(head_lines)
         all_trows = (render_table(fr, left_w, sel=sel)
                      if fr.get("elements") else [])
         hdr_row = all_trows[0] if all_trows else None
@@ -1793,8 +1813,8 @@ def run_curses(scr, collector, args):
         bar_w = (left_w if side_w else width) - 2
         threat_rows = render_threat_bar(fr, bar_w)
 
-        _draw_rows(scr, [head_txt], 0, width, colors)
-        y = 1
+        _draw_rows(scr, head_lines, 0, width, colors)
+        y = len(head_lines)
 
         if not side_w:
             own_rows = render_own_ship_panel(fr, width)

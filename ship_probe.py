@@ -44,6 +44,14 @@ _RESULTS_NAME = "ship_results.json"
 # ship_results.json is read whole + rewritten synchronously on the game tick
 # for every command - cap the accumulated history so both stay bounded.
 _RESULTS_KEEP = 300
+# While a section generator (sonar_arrays) is mid-slice, nothing would
+# otherwise be written for its whole wall-clock duration. Flush a partial
+# snapshot at least this often so instruments never black out.
+_MID_SLICE_FLUSH_S = 2.0
+# read_ai_elements is a full element pass (detect_player + player_navigation +
+# per-element reads); skip it when the last ai_state.json write is younger -
+# the bursty double-update within ~11 s was pure waste (BRIEF Auftrag 3c).
+_AI_WRITE_MIN_S = 8.0
 _LOCK_NAME = "ship_probe.lock"
 _LOCK_STALE_S = 30 * 60
 
@@ -79,6 +87,11 @@ _DEFAULTS = {
     "read_sonar_arrays": True,
     "max_sonar_arrays": 4,
     "max_sonar_contacts": 20,
+    # false (default): slim contact fields - bearing/range/elevation/course/
+    # speed/signal/noise/doppler/category + nan (IsNaN) = ~10 C# reads per
+    # contact instead of 18. true restores every field incl. the noise split,
+    # database_id, beam_type, id and relative_bearing.
+    "sonar_contacts_full": False,
     "read_ai": True,
     "max_ai_elements": 30,
     "read_mission": True,
@@ -1835,15 +1848,31 @@ class _Probe(object):
                         a["contacts_err"] = "index %d failed" % j
                         break
                     ct = {}
-                    for name, attr in (
-                        ("bearing", "Bearing"), ("range", "Range"), ("elevation", "Elevation"),
-                        ("course", "Course"), ("speed", "Speed"), ("signal", "Signal"),
-                        ("noise", "Noise"), ("self_noise", "SelfNoise"),
-                        ("flow_noise", "FlowNoise"), ("ambient_noise", "AmbientNoise"),
-                        ("thermal_noise", "ThermalNoise"), ("doppler", "DopplerCoef"),
-                        ("category", "Category"), ("database_id", "DatabaseID"),
-                        ("beam_type", "BeamType"), ("id", "ID"),
-                    ):
+                    # slim field set (sonar_contacts_full=false, default):
+                    # the values a sonar operator actually needs plus IsNaN
+                    # (which flips once the game resolves a value). The exotic
+                    # noise-split / database fields stay behind the full flag
+                    # (BRIEF Auftrag 3b).
+                    if self.cfg.get("sonar_contacts_full"):
+                        cattrs = (
+                            ("bearing", "Bearing"), ("range", "Range"), ("elevation", "Elevation"),
+                            ("course", "Course"), ("speed", "Speed"), ("signal", "Signal"),
+                            ("noise", "Noise"), ("self_noise", "SelfNoise"),
+                            ("flow_noise", "FlowNoise"), ("ambient_noise", "AmbientNoise"),
+                            ("thermal_noise", "ThermalNoise"), ("doppler", "DopplerCoef"),
+                            ("category", "Category"), ("database_id", "DatabaseID"),
+                            ("beam_type", "BeamType"), ("id", "ID"),
+                        )
+                        want_relb = True
+                    else:
+                        cattrs = (
+                            ("bearing", "Bearing"), ("range", "Range"), ("elevation", "Elevation"),
+                            ("course", "Course"), ("speed", "Speed"), ("signal", "Signal"),
+                            ("noise", "Noise"), ("doppler", "DopplerCoef"),
+                            ("category", "Category"),
+                        )
+                        want_relb = False
+                    for name, attr in cattrs:
                         rc = _try(lambda attr=attr: getattr(c, attr))
                         if rc[0] == "ok":
                             v = rc[1]
@@ -1851,17 +1880,18 @@ class _Probe(object):
                                 ct[name] = _safe_num(v)
                             else:
                                 ct[name] = _desc(v, 30)
-                    relb = _try(lambda: c.RelativeBearing)
-                    if relb[0] == "ok" and relb[1] is not None:
-                        try:
-                            ct["relative_bearing"] = [_safe_num(relb[1].Item1), _safe_num(relb[1].Item2)]
-                        except Exception:
-                            ct["relative_bearing"] = _safe_num(relb[1])
+                    if want_relb:
+                        relb = _try(lambda: c.RelativeBearing)
+                        if relb[0] == "ok" and relb[1] is not None:
+                            try:
+                                ct["relative_bearing"] = [_safe_num(relb[1].Item1), _safe_num(relb[1].Item2)]
+                            except Exception:
+                                ct["relative_bearing"] = _safe_num(relb[1])
                     cnan = _try(lambda: c.IsNaN)
                     if cnan[0] == "ok":
                         ct["nan"] = bool(cnan[1])
                     cl.append(ct)
-                    yield  # per-contact checkpoint (18 C# reads)
+                    yield  # per-contact checkpoint
                 a["contacts"] = cl
             out["arrays"].append(a)
             yield  # per-array checkpoint
@@ -1905,8 +1935,20 @@ class _Probe(object):
         """Enumerate all AI element namespaces in Blackboard.storage and
         capture identity/position/assignment/contact-count per element.
         Writes ai_state.json. Player namespace is skipped (player data is
-        already in ship_state.json). Every field is _try-guarded; contact
+        already in ship_state.json). Every field is _try-guarded;         contact
         access is limited to .Count (track access = freeze risk)."""
+        # Write damping (BRIEF Auftrag 3c): the full pass costs detect_player +
+        # player_navigation + one C# read set per element - skip it entirely
+        # while the last write is younger than _AI_WRITE_MIN_S and serve the
+        # cached snapshot instead. Skip note max once per window.
+        now_mono = time.monotonic()
+        last_w = getattr(self, "_ai_last_write_mono", 0.0)
+        cached = getattr(self, "_ai_last_result", None)
+        if cached is not None and (now_mono - last_w) < _AI_WRITE_MIN_S:
+            if not getattr(self, "_ai_skip_emitted", False):
+                self.emit("ai: skip fresh write (%.1fs < %.0fs)" % (now_mono - last_w, _AI_WRITE_MIN_S))
+                self._ai_skip_emitted = True
+            return dict(cached)
         out = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "count": 0, "elements": []}
         bb = self._blackboard_storage()
         if not bb:
@@ -2090,6 +2132,9 @@ class _Probe(object):
         out["count"] = len(elements)
         out["elements"] = elements
         self._write_state_async(_AI_STATE_NAME, out)
+        self._ai_last_write_mono = time.monotonic()
+        self._ai_last_result = out
+        self._ai_skip_emitted = False
         self.emit("ai: %d elements -> %s" % (len(elements), _AI_STATE_NAME))
         return out
 
@@ -2731,6 +2776,7 @@ class _Probe(object):
         acc += time.time() - t0
         if not done:
             self._slice_job = [name, gen, acc]
+            self._maybe_mid_slice_flush()
             return
         self.note_perf("sec_" + name, acc)
         if isinstance(result, dict):
@@ -2756,7 +2802,27 @@ class _Probe(object):
         self.player_state = st
         self._write_state_async(_STATE_NAME, st)
         self.state_count += 1
+        self._last_state_flush_mono = time.monotonic()
         self.note_perf("state_enqueue_s", time.time() - _t_write)
+
+    def _maybe_mid_slice_flush(self):
+        """Keep ship_state.json fresh while a section generator is mid-slice:
+        if the last write is older than _MID_SLICE_FLUSH_S, merge a fresh
+        clock reading (~1 ms) into the partial buffer and flush. Silent -
+        no log line (BRIEF Auftrag 3a)."""
+        if not self._partial_state:
+            return
+        last = getattr(self, "_last_state_flush_mono", 0.0)
+        if time.monotonic() - last < _MID_SLICE_FLUSH_S:
+            return
+        try:
+            clk = self.read_clock_section()
+            if isinstance(clk, dict) and clk:
+                self._partial_state["clock"] = clk
+                self._section_ts["clock"] = time.time()
+        except Exception as e:
+            self.note_error("mid_slice_clock", e)
+        self._flush_partial_state()
 
     def note_perf(self, key, dt):
         """Record a named wall-clock duration (seconds) for measure_perf."""

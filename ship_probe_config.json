@@ -54,6 +54,7 @@
   "read_sonar_arrays": true,
   "max_sonar_arrays": 4,
   "max_sonar_contacts": 20,
+  "sonar_contacts_full": false,
   "read_ai": true,
   "max_ai_elements": 30,
   "read_mission": true,

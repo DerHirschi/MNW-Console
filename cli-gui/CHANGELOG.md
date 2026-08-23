@@ -5,6 +5,32 @@ Alle nennenswerten Änderungen dieses Teilprojekts. Format angelehnt an
 
 ## [Unreleased]
 
+### 2026-08-23 — ai_tactical: PROBE BUSY-Banner bei Tick-Löchern
+
+**Befund (live gemessen):** Der `_random_tick_`-Hook des Spiels kommt in
+Schüben mit 7–12 s Funklöchern — in diesen Fenstern schreibt der Probe
+nichts (auch clock/navigation nicht), die TUI friert ein. Das vom Nutzer
+gemeldete Muster „2 KI-Updates hintereinander, dann ~30 s Pause" ist die
+`ai`-Sektion, die bei Tick-Schüben zweimal binnen ~11 s feuert; zusätzlich
+blockiert `sonar_arrays` mit >50 Kontakten/Array ~12 s pro Array.
+
+**Behoben (Display-Seite)**
+
+- Neuer Amber-Banner `!! PROBE BUSY - no fresh data for Ns (game tick
+  stall) !!` unter dem Header, sobald `ship_state` älter als 15 s ist —
+  in curses und `--json`/Textmodus identisch (`render_frame_lines[:2]`).
+  Rein funktional: `probe_busy_age(frame)` + 5 Tests; live verifiziert,
+  dass bei frischen Daten (Age 1 s) korrekt kein Banner erscheint.
+
+**Probe-seitig angefordert:** Auftrag 3 in
+`../ship-probe/BRIEF_orders_prune.md` — inkrementelle State-Writes beim
+Slicing (≥ alle 2 s), schlanker Kontaktmodus für sonar_arrays
+(`sonar_contacts_full:false`, 6 statt ~16 Attribute/Kontakt),
+AI-Write-Dämpfung (<8 s → Skip). Auftrag 1 (Pruning) ist inzwischen live:
+Orders-Datei leer, Kanal verarbeitet wieder.
+
+Suite: 81 grün.
+
 ### 2026-08-23 — ai_tactical: Command-Kanal-Deadlock nach TUI-Restart behoben
 
 **Ursache (live verifiziert):** Der Probe hält `last_cmdid` nur im RAM
