@@ -111,7 +111,7 @@ probe-side issue — tracked in `../ship-probe/BRIEF_ns_dump_multihost.md`
 
 ```sh
 python3 ai_tactical.py --log-dir "<MNW>/Var/Scripts/Execute/_Source" [--interval 5]
-python3 ai_tactical.py --remote 'masto@192.168.1.100:"/abs/log/dir"'   # SSH fetch
+python3 ai_tactical.py --remote 'user@remote-ip:"/abs/log/dir"'        # SSH fetch
 python3 ai_tactical.py --log-dir <dir> --json --read-only              # one frame as JSON
 python3 ai_tactical.py --remote '...' --json --count 30                # NDJSON stream (1 frame/poll)
 ```
