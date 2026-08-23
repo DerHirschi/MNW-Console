@@ -26,6 +26,8 @@ import sys
 import json
 import time
 import io
+import queue
+import threading
 import traceback
 import re
 
@@ -44,16 +46,20 @@ _LOCK_STALE_S = 30 * 60
 
 _DEFAULTS = {
     "log_dir": "",
-    "tick_delay": 30,
+    "tick_delay": 1,
+    "min_tick_interval": 0.2,
     "heartbeat_every": 120,
     "console_log": True,
     "require_player": True,
     "target_element_id": 0,
     "max_contacts": 50,
-    "max_commands_per_cycle": 10,
+    "max_commands_per_cycle": 1,
     "allow_commands": ["helm", "planes", "sd-dump", "tanks", "env", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc", "ai-state"],
     "resolve_positions": False,
     "state_every": 3,
+    "collect_mode": "queue",
+    "sections_per_tick": 1,
+    "section_slice_ms": 6.0,
     "read_identity": True,
     "read_navigation": True,
     "read_blackboard": True,
@@ -69,8 +75,33 @@ _DEFAULTS = {
     "max_ai_elements": 30,
     "read_mission": True,
     "read_clock": True,
-    "measure_perf": False,
+    "measure_perf": True,
 }
+
+# Rotating section queue for collect_mode="queue" (2026-08-23). Each entry is
+# (section_name, reader_method_name, default_interval_in_acted_ticks). Order =
+# priority: cheap/high-frequency sections first, heavy killers last. Each acted
+# tick runs at most sections_per_tick entries whose interval has elapsed; the
+# result is written into ship_state.json IMMEDIATELY (partial state, no full
+# round wait). Intervals can be overridden per-section via the config key
+# "section_interval" {name: ticks}. C# call cost per section (measured live):
+#   clock ~2, identity ~10, navigation ~30, blackboard 11, contacts <=650,
+#   sonar <=100, steering ~25, systems <=250, ai mostly-py, mission ~5,
+#   sonar_arrays <=1480 (~216 ms wall - TIME-SLICED via iter_sonar_arrays
+#   generator: pumped max section_slice_ms per tick until done).
+_SECTION_DEFS = (
+    ("clock",        "read_clock_section",     1),
+    ("navigation",   "read_navigation",        1),
+    ("blackboard",   "read_blackboard",        2),
+    ("contacts",     "read_contacts",          2),
+    ("identity",     "read_identity_section",  3),
+    ("sonar",        "read_sonar",             3),
+    ("steering",     "read_steering",          3),
+    ("systems",      "read_systems",           5),
+    ("ai",           "read_ai_elements",       5),
+    ("mission",      "read_mission",          30),
+    ("sonar_arrays", "iter_sonar_arrays",     10),
+)
 
 _MAST_STATUS = {"retracted": 0, "moving": 1, "raised": 2}
 
@@ -566,6 +597,27 @@ class _Probe(object):
         self._eot_enum_err = None
         self._cm_cache = None
         self._player_cache = None
+        # Rotating section queue state (collect_mode="queue", 2026-08-23).
+        # _partial_state holds every section result collected so far and is
+        # written to ship_state.json after EACH section run (immediate write,
+        # no full-round wait). Consumers render missing sections as "?" until
+        # the first rotation completes.
+        self._partial_state = {}
+        self._section_idx = 0
+        self._section_last_run = {}
+        self._sections_collected = set()
+        self._section_ts = {}
+        self._acted_count = 0
+        self._last_act_monotonic = 0.0
+        self.perf_marks = {}
+        # Background state writer (2026-08-23): measured live, the synchronous
+        # ship_state.json write blocked the game thread ~57 ms per acted tick
+        # on the game volume -> regular stutters. The worker thread owns all
+        # disk I/O for telemetry files; the game thread only enqueues.
+        self._writeq = queue.Queue(maxsize=8)
+        self._write_errors = []
+        self._writer_thread = None
+        self._slice_job = None  # [name, generator, acc_dt] while slicing
 
     # ---------------------------------------------------------------
     # resolution helpers
@@ -780,9 +832,9 @@ class _Probe(object):
         try:
             with io.open(tmp, "w", encoding="utf-8") as f:
                 json.dump(obj, f, default=_json_default)
-            if os.path.isfile(path):
-                os.remove(path)
-            os.rename(tmp, path)
+            # single syscall atomic replace (Windows-compatible); the old
+            # remove()+rename() pair doubled the disk operations per write
+            os.replace(tmp, path)
             return True
         except Exception as e:
             self.note_error("write_" + fname, e)
@@ -792,6 +844,83 @@ class _Probe(object):
             except Exception:
                 pass
             return False
+
+    # ---------------------------------------------------------------
+    # background state writer: telemetry file I/O off the game thread
+    # ---------------------------------------------------------------
+
+    def _writer_loop(self):
+        while True:
+            item = self._writeq.get()
+            try:
+                if item is None:
+                    return
+                path, obj = item
+                try:
+                    tmp = path + ".tmp"
+                    with io.open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(obj, f, default=_json_default)
+                    os.replace(tmp, path)
+                except Exception as e:
+                    self._write_errors.append("%s: %s" % (os.path.basename(path), _desc(e, 80)))
+                    del self._write_errors[:-20]
+            finally:
+                self._writeq.task_done()
+
+    def _ensure_writer(self):
+        if getattr(self, "_writer_thread", None) is not None and self._writer_thread.is_alive():
+            return
+        t = threading.Thread(target=self._writer_loop, name="mnw-state-writer")
+        t.daemon = True
+        t.start()
+        self._writer_thread = t
+
+    def _write_state_async(self, fname, obj):
+        """Hand the state dict to the background writer. The game thread pays
+        ONLY the queue put (<0.1 ms) - both json serialization AND disk I/O
+        happen off-thread (measured: dumps alone was ~46 ms on the game
+        thread, sync write 57 ms). obj must be a private snapshot that nobody
+        mutates afterwards - our flush builds a fresh dict every time.
+        Queue overflow drops the oldest state (stale telemetry is worthless)."""
+        self._ensure_writer()
+        try:
+            self._writeq.put_nowait((os.path.join(self.log_dir, fname), obj))
+        except queue.Full:
+            try:
+                self._writeq.get_nowait()
+            except Exception:
+                pass
+            try:
+                self._writeq.put_nowait((os.path.join(self.log_dir, fname), obj))
+            except queue.Full:
+                pass
+
+    def _drain_write_errors(self):
+        errs = self._write_errors
+        if errs:
+            self._write_errors = []
+            for e in errs:
+                self.note_error("async_write", e)
+
+    def _flush_writer(self, timeout=2.0):
+        """Block until all queued writes reached the disk (tests / finish).
+        unfinished_tasks counts items picked up but not yet replaced, so this
+        is race-free (unlike empty())."""
+        t = getattr(self, "_writer_thread", None)
+        if t is None or not t.is_alive():
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self._writeq.unfinished_tasks > 0:
+            time.sleep(0.005)
+
+    def stop_writer(self):
+        if getattr(self, "_writer_thread", None) is not None and self._writer_thread.is_alive():
+            try:
+                self._writeq.put_nowait(None)
+            except queue.Full:
+                pass
+            self._writer_thread.join(timeout=2.0)
+        self._writer_thread = None
 
     # ---------------------------------------------------------------
     # own-element data (READ side)
@@ -923,6 +1052,42 @@ class _Probe(object):
             except Exception as e:
                 return _EnumRefError("member %r.%r: %s" % (tname, mname, _desc(e, 60)))
         return _parse_ctl_arg(a)
+
+    def read_clock_section(self):
+        """Clock-only section for collect_mode="queue" (extracted from
+        collect_state). Exactly 2 C# reads (Time, TimeScale)."""
+        out = {}
+        try:
+            cmgr = self.clock_manager()
+            if cmgr is None:
+                out["err"] = "no clock manager"
+            else:
+                t = _try(lambda: str(cmgr.Time))
+                if t[0] == "ok":
+                    out["time"] = t[1]
+                ts = _try(lambda: float(cmgr.TimeScale))
+                if ts[0] == "ok":
+                    out["scale"] = ts[1]
+        except Exception as e:
+            out["err"] = _desc(e, 100)
+        return out
+
+    def read_identity_section(self):
+        """Identity-only section for collect_mode="queue". Resolves the player
+        info (cached) with a host-_Information fallback, then reuses
+        read_identity()."""
+        if not self.cfg.get("read_identity", True):
+            return {"disabled": True}
+        pinfo = self.player_info()
+        info = pinfo
+        if info is None and self.host is not None:
+            info = self.host_get("_Information")
+        if info is None:
+            return {"err": "no _Information"}
+        try:
+            return self.read_identity(info)
+        except Exception as e:
+            return {"err": _desc(e, 100)}
 
     def read_navigation(self):
         nav = self.host_get("client")
@@ -1549,12 +1714,12 @@ class _Probe(object):
 
         Controller.Access[Type]() was suspected to hang on elements that LACK
         the component (freeze 2026-08-13), but Access is a pure
-        _Components-Dictionary lookup (no Unity calls), the
-        gate probe proved access_* ok on the PLAYER controller, and the live
-        run confirmed Access[SonarSystem]() = ok. The player Virginia is
-        sonar-equipped, so SonarSystem is guaranteed present -> Access[] is
-        safe. The old _Components field scan is dead (that field is private,
-        invisible to pythonnet getattr — same for the nested .Controller and
+        _Components-Dictionary lookup (no Unity calls), the gate probe proved
+        access_* ok on the PLAYER controller, and the live run confirmed
+        Access[SonarSystem]() = ok. The player Virginia is sonar-equipped,
+        so SonarSystem is guaranteed present -> Access[] is safe. The old
+        _Components field scan is dead (that field is private, invisible to
+        pythonnet getattr — same for the nested .Controller and
         .Hub, which have no such fields exposed at all). Returns the
         SonarSystem instance or None."""
         ctrl = self.player_controller()
@@ -1580,12 +1745,11 @@ class _Probe(object):
         self._sonar_diag_emitted = True
         self.emit(line)
 
-    def read_sonar_arrays(self):
-        """Enumerate the player's SonarSystem.Sonars (List<ISensor>) — the actual
-        sonar arrays (hull + towed broadband passive etc.). Per array: identity
-        fields, contact count and per-contact signal/noise breakdown. ONLY field
-        reads and public property access — no Controller.Access, no Track access.
-        Frozen sonar systems (no Sonars populated yet) yield an empty list."""
+    def iter_sonar_arrays(self):
+        """Generator form of read_sonar_arrays: yields after every contact and
+        every array so the queue scheduler can time-slice it across ticks
+        (measured live: one full run = ~216 ms of C# property reads -> the
+        worst stutter source). Final StopIteration carries the result dict."""
         out = {"arrays": [], "err": None}
         sys = self._player_sonar_system()
         if sys is None:
@@ -1640,17 +1804,27 @@ class _Probe(object):
                 a["contacts_err"] = contacts[1][:60]
             else:
                 clist = contacts[1]
+                # NOTE: do NOT materialize the .NET list via list(clist) here -
+                # marshalling all contact objects in ONE step caused ~250 ms
+                # single-tick spikes (tick_max_s) that no slice budget could
+                # bound. len() + per-index access keeps every C# transition
+                # inside one per-contact yield instead.
                 try:
-                    citems = list(clist)
+                    ccount = len(clist)
                 except Exception:
                     a["contacts_err"] = "not enumerable"
-                    citems = []
-                a["contact_count"] = len(citems)
-                self.emit("cp: sonar array %d contacts=%d" % (i, len(citems)))
+                    ccount = 0
+                a["contact_count"] = ccount
+                self.emit("cp: sonar array %d contacts=%d" % (i, ccount))
                 cl = []
-                for j, c in enumerate(citems):
+                for j in range(ccount):
                     if j >= maxc:
                         a["contacts_truncated"] = True
+                        break
+                    try:
+                        c = clist[j]
+                    except Exception:
+                        a["contacts_err"] = "index %d failed" % j
                         break
                     ct = {}
                     for name, attr in (
@@ -1679,10 +1853,22 @@ class _Probe(object):
                     if cnan[0] == "ok":
                         ct["nan"] = bool(cnan[1])
                     cl.append(ct)
+                    yield  # per-contact checkpoint (18 C# reads)
                 a["contacts"] = cl
             out["arrays"].append(a)
+            yield  # per-array checkpoint
         self.emit("cp: sonar arrays loop done")
         return out
+
+    def read_sonar_arrays(self):
+        """Bulk driver for iter_sonar_arrays (legacy collect_state path and
+        tests): runs the sliced generator to completion in one go."""
+        gen = self.iter_sonar_arrays()
+        try:
+            while True:
+                next(gen)
+        except StopIteration as si:
+            return si.value
 
     # ---------------------------------------------------------------
     # AI-element enumeration (reads ALL element namespaces from the
@@ -1895,7 +2081,7 @@ class _Probe(object):
             self.emit("cp: ai elem %d ok" % nid)
         out["count"] = len(elements)
         out["elements"] = elements
-        self._atomic_write(_AI_STATE_NAME, out)
+        self._write_state_async(_AI_STATE_NAME, out)
         self.emit("ai: %d elements -> %s" % (len(elements), _AI_STATE_NAME))
         return out
 
@@ -2439,6 +2625,142 @@ class _Probe(object):
         return st
 
     # ---------------------------------------------------------------
+    # rotating section queue (collect_mode="queue", 2026-08-23)
+    # ---------------------------------------------------------------
+
+    def _section_interval(self, name, default):
+        iv = self.cfg.get("section_interval")
+        if isinstance(iv, dict):
+            try:
+                v = int(iv.get(name, default))
+                if v >= 1:
+                    return v
+            except Exception:
+                pass
+        return max(1, int(default))
+
+    def _collect_next_section(self):
+        """Run at most sections_per_tick queue entries whose interval has
+        elapsed. Each completed section is merged into _partial_state and the
+        FULL partial state is written to ship_state.json immediately (no
+        full-round wait). Sections whose reader returns a GENERATOR are
+        time-sliced: the generator is pumped up to section_slice_ms per tick
+        until it finishes (sonar_arrays ~216 ms -> <=6 ms chunks). A running
+        slice job owns the tick; no other sections start meanwhile.
+        Returns True if any section work happened."""
+        # resume an in-flight sliced section first - it owns this tick
+        if self._slice_job is not None:
+            self._pump_slice()
+            return True
+        ran_any = False
+        budget = max(1, int(self.cfg.get("sections_per_tick", 1)))
+        n_defs = len(_SECTION_DEFS)
+        for _ in range(n_defs):
+            if budget <= 0:
+                break
+            name, meth_name, default_iv = _SECTION_DEFS[self._section_idx]
+            self._section_idx = (self._section_idx + 1) % n_defs
+            cfg_key = "read_%s" % name
+            if not self.cfg.get(cfg_key, True):
+                continue
+            last = self._section_last_run.get(name)
+            if last is not None and (self._acted_count - last) < self._section_interval(name, default_iv):
+                continue
+            fn = getattr(self, meth_name, None)
+            if fn is None:
+                continue
+            self._section_last_run[name] = self._acted_count
+            t0 = time.time()
+            try:
+                res = fn()
+                if hasattr(res, "send") and hasattr(res, "__next__"):
+                    # generator -> time-sliced across ticks (anti-stutter)
+                    self._slice_job = [name, res, 0.0]
+                    self._pump_slice()
+                    return True
+                if isinstance(res, dict):
+                    self._partial_state[name] = res
+            except Exception as e:
+                self.note_error("section_" + name, e)
+                self._partial_state[name] = {"err": _desc(e, 100)}
+            self.note_perf("sec_" + name, time.time() - t0)
+            self._sections_collected.add(name)
+            self._section_ts[name] = time.time()
+            ran_any = True
+            budget -= 1
+        if ran_any:
+            self._flush_partial_state()
+        return ran_any
+
+    def _pump_slice(self):
+        """Drive the active section generator for at most section_slice_ms of
+        wall-clock this tick. Completion merges the generator's return value
+        into _partial_state and flushes ship_state.json."""
+        name, gen, acc = self._slice_job
+        slice_ms = 6.0
+        try:
+            slice_ms = float(self.cfg.get("section_slice_ms", 6.0) or 6.0)
+        except Exception:
+            slice_ms = 6.0
+        deadline = time.monotonic() + max(0.5, slice_ms) / 1000.0
+        t0 = time.time()
+        done = False
+        result = None
+        try:
+            while True:
+                try:
+                    next(gen)
+                except StopIteration as si:
+                    result = si.value
+                    done = True
+                    break
+                if time.monotonic() >= deadline:
+                    break
+        except Exception as e:
+            self.note_error("section_" + name, e)
+            result = {"err": _desc(e, 100)}
+            done = True
+        acc += time.time() - t0
+        if not done:
+            self._slice_job = [name, gen, acc]
+            return
+        self.note_perf("sec_" + name, acc)
+        if isinstance(result, dict):
+            self._partial_state[name] = result
+        self._sections_collected.add(name)
+        self._section_ts[name] = time.time()
+        self._slice_job = None
+        self._flush_partial_state()
+
+    def _flush_partial_state(self):
+        """Build the full partial-state snapshot and hand it to the background
+        writer (never block the game thread on disk I/O here)."""
+        _t_write = time.time()
+        st = dict(self._partial_state)
+        st["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        _t_dp = time.time()
+        st["player"] = self.detect_player()
+        self.note_perf("detect_player_s", time.time() - _t_dp)
+        if self._section_ts:
+            st["_sec_ts"] = dict(self._section_ts)
+        if self.cfg.get("measure_perf"):
+            st["perf"] = dict(self.perf_marks)
+        self.player_state = st
+        self._write_state_async(_STATE_NAME, st)
+        self.state_count += 1
+        self.note_perf("state_enqueue_s", time.time() - _t_write)
+
+    def note_perf(self, key, dt):
+        """Record a named wall-clock duration (seconds) for measure_perf."""
+        if not self.cfg.get("measure_perf"):
+            return
+        marks = getattr(self, "perf_marks", None)
+        if marks is None:
+            marks = {}
+            self.perf_marks = marks
+        marks[key] = round(dt, 6)
+
+    # ---------------------------------------------------------------
     # command dispatch (CONTROL side)
     # ---------------------------------------------------------------
 
@@ -2459,14 +2781,17 @@ class _Probe(object):
 
     def dispatch_orders(self):
         path = os.path.join(self.log_dir, _ORDERS_NAME)
+        _t_read = time.time()
         try:
             with io.open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except IOError:
+            self.note_perf("orders_read_s", time.time() - _t_read)
             return
         except Exception as e:
             self.note_error("orders_read", e)
             return
+        self.note_perf("orders_read_s", time.time() - _t_read)
         cmds = data.get("commands") or []
         if not isinstance(cmds, list):
             cmds = []
@@ -6276,12 +6601,27 @@ class _Probe(object):
         self.tick_count += 1
         if self.tick_count % max(1, int(self.cfg.get("tick_delay", 30))) != 0:
             return
+        # Wall-clock throttle: _random_tick_ fires ~2.9x/s in practice; skip
+        # acting when the last acted tick is less than min_tick_interval ago.
+        min_iv = 0.0
+        try:
+            min_iv = float(self.cfg.get("min_tick_interval", 0) or 0)
+        except Exception:
+            min_iv = 0.0
+        if min_iv > 0:
+            now = time.monotonic()
+            if (now - self._last_act_monotonic) < min_iv:
+                return
+            self._last_act_monotonic = now
+        self._drain_write_errors()
+        _t_block0 = time.monotonic()
         self._drain_dc_deferred()
         if getattr(self, "command_only", False):
             try:
                 self.dispatch_orders()
             except Exception as e:
                 self.note_error("tick_command_only", e)
+            self._record_block(_t_block0)
             return
         try:
             if self.active_mission() is None:
@@ -6290,28 +6630,56 @@ class _Probe(object):
                 return
         except Exception:
             pass
-        # Throttle the heavy state collection: state_every controls how many
-        # tick_delay cycles do a full C# collect (state_every=1 == old
-        # behavior). Between full collects we only dispatch orders (cheap file
-        # reads) so the probe does not stall the Unity host every cycle.
-        # NOTE: _acted_count (not tick_count) is used because tick_count is the
-        # RAW random-tick counter and collect_state() is only reached after the
-        # tick_delay guard — so tick_count is always a multiple of tick_delay
-        # here. Using tick_count % state_every would be a no-op when
-        # state_every divides tick_delay (e.g. 30 % 3 == 0 always true).
-        self._acted_count = getattr(self, "_acted_count", -1) + 1
-        state_every = max(1, int(self.cfg.get("state_every", 3)))
-        if self._acted_count % state_every == 0:
+        # State collection: two modes.
+        #   bulk  - legacy: full collect_state() every state_every acted ticks
+        #           (all sections in ONE tick -> ~500+ C# calls, frame drops).
+        #   queue - rotating section queue (default): at most
+        #           sections_per_tick sections per acted tick, each written to
+        #           ship_state.json IMMEDIATELY (uniform round-robin).
+        #           Measured live: _random_tick_ fires ~2.9x/s -> full
+        #           11-section cycle ~3.8 s. Anti-stutter rules:
+        #             - max_commands_per_cycle=1: one command per tick, no
+        #               dispatch bursts (tanks/env are heavy native calls)
+        #             - heavy sections throttled via section_interval instead
+        #               of a global time gate (min_tick_interval stays
+        #               supported; default 0 = off)
+        self._acted_count += 1
+        if str(self.cfg.get("collect_mode", "queue")) == "bulk":
+            # NOTE: use _acted_count (not tick_count) — see comment above.
+            state_every = max(1, int(self.cfg.get("state_every", 3)))
+            if self._acted_count % state_every == 0:
+                try:
+                    self.collect_state()
+                except Exception as e:
+                    self.note_error("tick", e)
+        else:
             try:
-                self.collect_state()
+                self._collect_next_section()
             except Exception as e:
-                self.note_error("tick", e)
+                self.note_error("tick_sections", e)
         try:
             self.dispatch_orders()
         except Exception as e:
             self.note_error("tick_orders", e)
+        self._record_block(_t_block0)
         if self.tick_count % max(1, int(self.cfg.get("heartbeat_every", 120))) == 0:
             self.emit("tick=%d states=%d" % (self.tick_count, self.state_count))
+
+    def _record_block(self, t0):
+        """Record how long this acted tick blocks the game thread (seconds).
+        tick_last_s = most recent block, tick_max_s = worst observed. These
+        are the numbers that correlate with visible micro-stutters."""
+        if not self.cfg.get("measure_perf"):
+            return
+        dt = time.monotonic() - t0
+        marks = getattr(self, "perf_marks", None)
+        if marks is None:
+            marks = {}
+            self.perf_marks = marks
+        marks["tick_last_s"] = round(dt, 4)
+        prev = marks.get("tick_max_s") or 0
+        if dt > prev:
+            marks["tick_max_s"] = round(dt, 4)
 
     def host_label(self):
         try:
@@ -6409,6 +6777,8 @@ class _Probe(object):
 
     def finish(self):
         self.emit("SHIP PROBE END (states=%d)" % self.state_count)
+        self._drain_write_errors()
+        self.stop_writer()
         self.release_lock()
         self.log.close()
 

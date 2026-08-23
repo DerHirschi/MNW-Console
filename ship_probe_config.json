@@ -1,13 +1,13 @@
 {
-  "_comment": "read_sonar_arrays=false: frame drops from 4 arrays x ~30 contacts = 120 reads/tick on Unity main thread (2026-08-17). Sonar data still available via sonar --detail tracker API.",
-  "log_dir": "",
-  "tick_delay": 30,
+  "_comment": "collect_mode=queue: 1 section per acted tick, written immediately via BACKGROUND writer thread (sync write measured 57ms on game volume = stutter source). Heavy sections are TIME-SLICED: iter_sonar_arrays (~216ms) is pumped max section_slice_ms per tick until done. min_tick_interval=0.2: acted ticks ~2.9/s so slices resume fast; per-tick cost is bounded by the slice budget, not the throttle. measure_perf=true: tick block times + section costs in ship_state.json 'perf' (DISABLED in this config: perf markers off, stutter work is done). collect_mode=bulk restores legacy full collect_state() every state_every ticks.",  "log_dir": "",
+  "tick_delay": 1,
+  "min_tick_interval": 0.2,
   "heartbeat_every": 120,
   "console_log": true,
   "require_player": true,
   "target_element_id": 0,
   "max_contacts": 50,
-  "max_commands_per_cycle": 10,
+  "max_commands_per_cycle": 1,
   "allow_commands": [
     "helm",
     "planes",
@@ -36,6 +36,12 @@
   ],
   "resolve_positions": false,
   "state_every": 3,
+  "collect_mode": "queue",
+  "sections_per_tick": 1,
+  "section_slice_ms": 6,
+  "section_interval": {
+    "sonar_arrays": 40
+  },
   "read_identity": true,
   "read_navigation": true,
   "read_blackboard": true,

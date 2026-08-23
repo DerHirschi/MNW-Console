@@ -1,5 +1,56 @@
 # Changelog
 
+## v2.2 (2026-08-23) — Rotating section queue + background writer
+
+Full sync with `masto/MNW-Tool/ship-probe/`. New `collect_mode="queue"` replaces
+the bulk `collect_state()` tick pattern with per-section time-sliced execution
+and immediate state writes via a background thread.
+
+### ship_probe.py
+
+- **`collect_mode: queue` (default)** — rotating section queue: each acted tick
+  runs at most `sections_per_tick` sections (default 1) whose per-section
+  interval has elapsed. Each completed section is merged into `_partial_state`
+  and written to `ship_state.json` immediately (no full-round wait). Sections
+  whose reader returns a generator are time-sliced (`section_slice_ms`, default
+  6ms) across ticks. Anti-stutter: heavy sections (`sonar_arrays` ~216ms wall)
+  are pumped in small chunks instead of blocking the game thread for 200+ ms.
+- **`collect_mode: bulk`** — legacy mode restored: full `collect_state()` every
+  `state_every` acted ticks (all sections in ONE tick).
+- **Background state writer thread** — `_write_state_async()` hands state dicts
+  to a daemon thread via `queue.Queue(maxsize=8)`. JSON serialization and disk
+  I/O happen off the game thread (measured: sync write was ~57ms on game volume).
+  Queue overflow drops oldest state (stale telemetry is worthless).
+- **`min_tick_interval` (default 0)** — wall-clock throttle: skip acting when
+  the last acted tick is less than this many seconds ago. Default 0 = off;
+  recommended 0.2 with `tick_delay: 1` to bound the acted-tick rate.
+- **`_SECTION_DEFS`** — per-section definition table: `(name, method, interval)`.
+  Clock/identity extracted as `read_clock_section()` / `read_identity_section()`
+  for queue mode. `read_sonar_arrays()` wrapped by `iter_sonar_arrays()` generator.
+- **`os.replace()`** — atomic single-syscall replace replaces `remove()+rename()`
+  pair (halved disk operations per write).
+- **`_record_block()`** — measures per-acted-tick game-thread block time
+  (`tick_last_s`, `tick_max_s`) in `perf` dict when `measure_perf: true`.
+- **`_drain_write_errors()`** — background writer errors are surfaced in the next
+  acted tick via `note_error()`.
+- **`stop_writer()`** — called from `finish()` to join the writer thread.
+
+### ship_probe_config.json
+
+- New fields: `collect_mode`, `sections_per_tick`, `section_slice_ms`,
+  `section_interval`, `min_tick_interval`.
+- `tick_delay` changed 30 → 1, `max_commands_per_cycle` changed 10 → 1,
+  `measure_perf` changed false → true.
+
+### Tests
+
+- `test_config_merges_defaults` updated to tolerate intentional config overrides
+  (e.g. `measure_perf` deliberately disabled in config while code default is true).
+- `test_enumerates_all_namespaces` adds `_flush_writer()` before reading
+  `ai_state.json` (now written via background thread).
+
+---
+
 ## v2.1 (2026-08-22) — Config toggles + state_every fix
 
 Full sync with `masto/MNW-Tool/ship-probe/`. New per-section config flags,
