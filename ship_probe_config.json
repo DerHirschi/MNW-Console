@@ -8,6 +8,7 @@
   "target_element_id": 0,
   "max_contacts": 50,
   "max_commands_per_cycle": 1,
+  "element_action_grace_s": 5.0,
   "allow_commands": [
     "helm",
     "planes",

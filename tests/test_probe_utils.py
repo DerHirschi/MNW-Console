@@ -209,6 +209,7 @@ class DispatchOrdersTest(unittest.TestCase):
                 {"cmdid": 3, "action": "helm", "course": 90},
             ])
             probe = self._probe(tmp)
+            probe.cfg["element_action_grace_s"] = 0.0
             probe.dispatch_orders()
             res = self._read_results(tmp)
             self.assertEqual(sorted(int(r["cmdid"]) for r in res), [0, 1, 2, 3])

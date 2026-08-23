@@ -41,6 +41,9 @@ _AI_FRAG_TTL_S = 120
 _API_PROBE_NAME = "ship_probe_api.json"
 _ORDERS_NAME = "ship_orders.json"
 _RESULTS_NAME = "ship_results.json"
+# ship_results.json is read whole + rewritten synchronously on the game tick
+# for every command - cap the accumulated history so both stay bounded.
+_RESULTS_KEEP = 300
 _LOCK_NAME = "ship_probe.lock"
 _LOCK_STALE_S = 30 * 60
 
@@ -54,6 +57,11 @@ _DEFAULTS = {
     "target_element_id": 0,
     "max_contacts": 50,
     "max_commands_per_cycle": 1,
+    # How long the full probe keeps processed element-action commands
+    # (ns-dump/asg/ai-state/...) in ship_orders.json so the per-element
+    # command-only hosts (separate interpreters, own tick phase) can see and
+    # answer them too. 0 = old behavior (full probe eats them immediately).
+    "element_action_grace_s": 5.0,
     "allow_commands": ["helm", "planes", "sd-dump", "tanks", "env", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc", "ai-state"],
     "resolve_positions": False,
     "state_every": 3,
@@ -2797,6 +2805,7 @@ class _Probe(object):
             cmds = []
         command_only = bool(getattr(self, "command_only", False))
         max_cmds = max(1, int(self.cfg.get("max_commands_per_cycle", 10)))
+        elem_grace_s = float(self.cfg.get("element_action_grace_s", 5.0))
         results = []
         processed = 0
         processed_ids = set()
@@ -2815,6 +2824,18 @@ class _Probe(object):
             processed += 1
             self.last_cmdid = cmdid
             processed_ids.add(cmdid)
+            if str(cmd.get("action") or "") in self._ELEMENT_ACTIONS:
+                # Multi-host delivery (BRIEF Auftrag 2): command-only hosts
+                # run in separate interpreters with their own tick phase - the
+                # full probe must leave the order in the file for a grace
+                # window or it wins the read/prune race and answers alone.
+                g = getattr(self, "_elem_grace", None)
+                if g is None:
+                    g = self._elem_grace = {}
+                if cmdid not in g:
+                    g[cmdid] = time.monotonic()
+                    self.emit("orders: holding %s cmdid %d for %.1fs (multi-host delivery)"
+                              % (cmd.get("action"), cmdid, elem_grace_s))
             if self.cfg.get("measure_perf"):
                 _cmd_t0 = time.time()
             res = self.do_command(cmd)
@@ -2833,22 +2854,66 @@ class _Probe(object):
                     old = []
             except Exception:
                 old = []
-            self._atomic_write(_RESULTS_NAME, {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "results": old + results})
-        if not command_only and processed_ids:
+            # Bound the accumulated history: this file is read whole + rewritten
+            # synchronously on the game thread at every command tick - without
+            # a cap both costs grow O(session length).
+            merged = old + results
+            if len(merged) > _RESULTS_KEEP:
+                merged = merged[-_RESULTS_KEEP:]
+            if len(self.console_results) > _RESULTS_KEEP:
+                del self.console_results[:-_RESULTS_KEEP]
+            self._atomic_write(_RESULTS_NAME, {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "results": merged})
+        last_floor = self.last_cmdid
+        # Stale-order detection from the FIRST read: ids <= last_cmdid were
+        # skipped above and nobody removed them (external writers restart
+        # their cmdid floor -> dead channel until probe restart). No extra
+        # I/O - we reuse the already-parsed cmds list.
+        has_stale = False
+        if last_floor is not None:
+            for c in cmds:
+                cid = self._cmdid_of(c) if isinstance(c, dict) else None
+                if cid is not None and cid <= last_floor:
+                    has_stale = True
+                    break
+        if not command_only and (processed_ids or has_stale):
             # Only the lock-holding full probe owns the queue. Command-only
             # instances (one per element script, separate interpreter each)
             # must NOT re-run heavy commands like tanks/env across every tick
             # and every (re-)initialization - repeated native C# calls crashed
-            # the game (mono native crash 2026-08-16). Drop just the cmdids
-            # this instance ran; re-read so concurrent appends survive.
+            # the game (mono native crash 2026-08-16). Drop the cmdids this
+            # instance ran AND every id at/below the floor (already processed
+            # or obsolete after an external writer restart - never executed
+            # retroactively). Re-read so concurrent appends survive.
             try:
                 with io.open(path, "r", encoding="utf-8") as f:
                     cur = json.load(f)
                 cur_cmds = cur.get("commands") if isinstance(cur, dict) else None
                 if isinstance(cur_cmds, list):
+                    now = time.monotonic()
+                    grace = getattr(self, "_elem_grace", None)
+                    if grace is None:
+                        grace = self._elem_grace = {}
+                    for cid in [cid for cid, t0 in list(grace.items()) if now - t0 >= elem_grace_s]:
+                        del grace[cid]
+                    # element-action ids inside their delivery window stay in
+                    # the file even though they were processed / are below
+                    # the floor
+                    drop = set(processed_ids) - set(grace)
+                    floor_drops = 0
+                    if last_floor is not None:
+                        for c in cur_cmds:
+                            cid = self._cmdid_of(c) if isinstance(c, dict) else None
+                            if (cid is not None and cid <= last_floor
+                                    and cid not in drop and cid not in grace):
+                                drop.add(cid)
+                                floor_drops += 1
                     kept = [c for c in cur_cmds
-                            if not (isinstance(c, dict) and self._cmdid_of(c) in processed_ids)]
-                    self._atomic_write(_ORDERS_NAME, {"commands": kept})
+                            if not (isinstance(c, dict) and self._cmdid_of(c) in drop)]
+                    if len(kept) != len(cur_cmds):
+                        self._atomic_write(_ORDERS_NAME, {"commands": kept})
+                        if floor_drops:
+                            self.emit("orders: pruned %d stale cmdid(s) (floor=%d)"
+                                      % (floor_drops, last_floor))
             except Exception as e:
                 self.note_error("orders_clear", e)
 
@@ -5894,6 +5959,7 @@ class _Probe(object):
             if len(parts) < 3 or not parts[1].isdigit():
                 continue
             namespaces.setdefault(parts[1], {})[parts[2]] = v
+        pairs = []
         for ns in sorted(namespaces, key=lambda x: int(x)):
             kv = namespaces[ns]
             keylist = sorted(kv.keys())
@@ -5909,6 +5975,14 @@ class _Probe(object):
             line = "ns /%s/ style=%s keys(%d): %s" % (ns, style, len(keylist), ", ".join(keylist))
             lines.append(line)
             self.emit("ns-dump: " + line)
+            pairs.append((ns, style))
+        # Machine-parsable summary (display contract): one line listing every
+        # namespace THIS host can see, so element discovery survives even when
+        # individual ns lines fall out of the log tail.
+        summary = ",".join("%s:%s" % (ns, st if st != "?" else "unknown") for ns, st in pairs)
+        sline = "ns-dump: elements=[%s]" % summary
+        lines.append(sline)
+        self.emit(sline)
         self.emit("ns-dump: host done (%d namespaces)" % len(namespaces))
         return lines
 
@@ -5928,8 +6002,8 @@ class _Probe(object):
         lines.append("target element id=%d" % nid)
         kv = self._element_namespace(nid)
         if kv is None:
-            self.emit("asg cp0x: no /%d/ namespace on this host - skipping (multi-host safe)" % nid)
-            return None
+            self.emit("asg: no such element %d (not on this host)" % nid)
+            raise RuntimeError("element not found")
         self.emit("asg cp0a: namespace ok (%d keys)" % len(kv))
         for key, label in (("_CurrentAssignmentID", "assignment_id"),
                            ("_ActionPrepComplete", "action_prep"),
@@ -6011,8 +6085,10 @@ class _Probe(object):
         lines.append("target element id=%d" % nid)
         kv = self._element_namespace(nid)
         if kv is None:
-            self.emit("ai-state cp0x: no /%d/ namespace on this host - skipping" % nid)
-            return None
+            # Recognizable negative answer (display contract): lets the
+            # consumer cache the miss instead of re-asking every rotation.
+            self.emit("ai-state: no such element %d (not on this host)" % nid)
+            raise RuntimeError("element not found")
         self.emit("ai-state cp0a: namespace ok (%d keys)" % len(kv))
         # identity from _Information or _SelfInfo
         info = kv.get("_Information")

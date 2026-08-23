@@ -1,5 +1,39 @@
 # Changelog
 
+## v2.5 (2026-08-23) — ship_probe: multi-host delivery + stale-order pruning
+
+Sync ship_probe from `masto/MNW-Tool/`. Adds element-action grace window for
+multi-host delivery, results history cap, stale-order pruning, and ns-dump
+summary line. cli-gui unchanged.
+
+### ship_probe.py
+
+- **`element_action_grace_s` (default 5.0)** — holds element-action commands
+  (ns-dump/asg/ai-state/ai-attack/detected) in `ship_orders.json` for a grace
+  window so command-only hosts (separate interpreters, own tick phase) can see
+  and answer them. The full probe previously ate all processed orders
+  immediately, winning the read/prune race against the other hosts.
+- **`_RESULTS_KEEP = 300`** — caps accumulated results history. Without a cap
+  both `ship_results.json` and `console_results` grow O(session length),
+  costing O(n) synchronous reads on every command tick.
+- **Stale-order pruning** — ids ≤ `last_floor` are detected on the first read
+  and removed alongside processed ids. External writers that restart their
+  cmdid floor no longer deadlock the channel until probe restart. Logs
+  `orders: pruned N stale cmdid(s)`.
+- **ns-dump summary line** — machine-parsable `ns-dump: elements=[/13:style,...]`
+  listing every namespace this host sees, so element discovery survives even
+  when individual ns lines fall out of the log tail.
+- **asg/ai-state error handling** — raises `RuntimeError("element not found")`
+  instead of returning `None`, giving consumers a recognizable negative answer.
+- **disasm references cleaned** (8 occurrences — same set re-introduced by
+  upstream on each sync).
+
+### ship_probe_config.json
+
+- New field: `element_action_grace_s` (default 5.0).
+
+---
+
 ## v2.4 (2026-08-23) — cli-gui: cmdid deadlock fix + table headers + NaN sanitizer
 
 Sync ship_probe + cli-gui/ from `masto/MNW-Tool/`. cli-gui fixes a TUI-restart
