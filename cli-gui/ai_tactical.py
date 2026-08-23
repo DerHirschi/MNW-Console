@@ -33,7 +33,7 @@ Usage:
   python3 ai_tactical.py --log-dir <dir>                    local poll
   python3 ai_tactical.py --remote user@host:"/abs/log/dir"  ssh fetch
       [--interval 5] [--count N] [--json] [--no-color] [--read-only]
-      [--detect-interval 10] [--asg-ttl 120]
+      [--detect-interval 10] [--asg-ttl 60]
 
 The detected scan runs on its own clock: base cadence --detect-interval
 (min 10 s) plus an immediate re-scan whenever any AI element's state
@@ -104,6 +104,18 @@ def _num(v):
     if math.isnan(f) or math.isinf(f):
         return None
     return f
+
+
+def _json_safe(v):
+    """Recursively strip NaN/Infinity from pass-through structures so strict
+    JSON output never sees them (probe sonar tracks carry bare nan/inf)."""
+    if isinstance(v, dict):
+        return {k: _json_safe(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_json_safe(x) for x in v]
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return v
+    return _num(v)
 
 
 def _fmt(v, digits=1, unit=""):
@@ -621,7 +633,9 @@ def build_frame(data):
         },
         "sonar": {
             "count": sonar.get("count") if isinstance(sonar, dict) else None,
-            "tracks": sonar.get("tracks") if isinstance(sonar, dict) else [],
+            "tracks": _json_safe(sonar.get("tracks"))
+            if isinstance(sonar, dict)
+            else [],
         },
         "player": {
             "name": ident.get("name"),
@@ -742,7 +756,23 @@ def render_table(frame, width, sel=0):
         }
         return [vals[c[0]][:c[1]] for c in cols]
 
-    rows = [[_seg(" %-*s" % (width - 1, "".join(c[0].ljust(c[1] + 1)[:width - 1] for c in cols)), "hdr")]]
+    # header label -> (label with unit, min column width); falls back to the
+    # plain abbrev when the column is too narrow for it
+    _HDR_UNITS = {
+        "RANGE": ("RANGE km", 8),
+        "BRG": ("BRG\u00b0", 4),
+        "SPD": ("SPD kt", 6),
+        "HDG": ("HDG\u00b0", 4),
+        "DEP": ("DEP m", 5),
+    }
+
+    def hdr_label(name, w):
+        full = _HDR_UNITS.get(name)
+        return full[0] if full and len(full[0]) <= w else name
+
+    rows = [[_seg(" %-*s" % (width - 1,
+            "".join(hdr_label(c[0], c[1]).ljust(c[1] + 1)
+                    for c in cols)[:width - 1]), "hdr")]]
     for i, e in enumerate(els):
         vals = cells_for(e)
         base = threat_style(e)
@@ -1264,7 +1294,7 @@ class Collector(object):
     """Poll loop state machine: reads sources, queues API-cmd refreshes."""
 
     def __init__(self, source, interval=5.0, read_only=False,
-                 detect_interval=10.0, asg_ttl=120.0, ext_ttl=120.0,
+                 detect_interval=10.0, asg_ttl=60.0, ext_ttl=60.0,
                  refresh_after=45.0, count=None):
         self.source = source
         self.interval = interval
@@ -1276,6 +1306,7 @@ class Collector(object):
         self.count = count
         self.cycle = 0
         self.pending = {}
+        self.pending_ts = {}           # cid -> queue time (stagnation watch)
         self.prev_ranges = {}
         self.detected_map = {}
         self.detected_result = {}
@@ -1286,16 +1317,22 @@ class Collector(object):
         self.refresh_queued = False
         self.paused = False
         self._last_cmdid = -1          # floor vs probe clearing ship_orders.json
+        self._result_cmdid_max = -1    # highest cmdid ever seen in results
         self._last_detect_ts = 0.0     # time-based detect cadence (>= 10 s)
         self._detect_due = False       # event trigger: element sig changed
         self.sigs = {}                 # eid -> last seen element signature
         self._last_nsdump_cycle = -1000
+        self._nsdump_attempts = 0
 
     def send_commands(self, cmds):
         """Guarded write path: no-op list in read_only mode."""
         if self.read_only or not cmds:
             return []
-        ids = send_commands(self.source, cmds, floor=self._last_cmdid)
+        # floor above BOTH our own history and every cmdid the probe has ever
+        # answered: after a TUI restart the running probe's last_cmdid stays
+        # in RAM, and ids below it are skipped (and kept) forever
+        floor = max(self._last_cmdid, self._result_cmdid_max)
+        ids = send_commands(self.source, cmds, floor=floor)
         if ids:
             self._last_cmdid = max(self._last_cmdid, max(ids))
         return ids
@@ -1333,6 +1370,10 @@ class Collector(object):
             self._update_prev(data)
         return build_frame(data)
 
+    def _pop_pending(self, cid):
+        self.pending.pop(cid, None)
+        self.pending_ts.pop(cid, None)
+
     def _ingest_results(self, data, log_lines):
         self.detected_result = {}
         results = (data.get("results") or {}).get("results") or []
@@ -1341,10 +1382,16 @@ class Collector(object):
             if not isinstance(r, dict):
                 continue
             cid = r.get("cmdid")
+            if isinstance(cid, int) and cid > self._result_cmdid_max:
+                # highest id the probe ever answered — floor anchor for
+                # sends after a TUI restart (probe keeps last_cmdid in RAM)
+                self._result_cmdid_max = cid
             action = r.get("action")
             purpose = self.pending.get(cid)
             if action == "detected" or purpose == "detect":
                 newest_det = r if newest_det is None or str(r.get("ts", "")) >= str(newest_det.get("ts", "")) else newest_det
+            if purpose == "detect":
+                self._pop_pending(cid)
             if purpose == "asg" or action == "asg":
                 vals = parse_asg_detail(r.get("detail") or [])
                 tid = vals.get("target_id")
@@ -1357,7 +1404,7 @@ class Collector(object):
                         vals["ts_epoch"] = ts_epoch
                         self.asg_map[tid] = vals
                 if purpose == "asg":
-                    self.pending.pop(cid, None)
+                    self._pop_pending(cid)
             if purpose == "ext" or action == "ai-state":
                 vals = parse_ai_state_detail(r.get("detail") or [])
                 tid = vals.get("target_id")
@@ -1368,17 +1415,17 @@ class Collector(object):
                         vals["ts_epoch"] = ts_epoch
                         self.ext_map[tid] = vals
                 if purpose == "ext":
-                    self.pending.pop(cid, None)
+                    self._pop_pending(cid)
             elif purpose == "contacts":
                 self.contacts_map = parse_ai_contacts_detail(r.get("detail") or [])
-                self.pending.pop(cid, None)
+                self._pop_pending(cid)
             elif purpose == "refresh":
-                self.pending.pop(cid, None)
+                self._pop_pending(cid)
                 self.refresh_queued = False
             elif purpose == "nsdump":
                 detail = r.get("detail") or []
                 self.ns_styles.update(parse_ns_styles(detail))
-                self.pending.pop(cid, None)
+                self._pop_pending(cid)
         if newest_det is not None:
             age = None
             ts = parse_ts(newest_det.get("ts"))
@@ -1393,6 +1440,18 @@ class Collector(object):
 
     def _queue_commands(self, data):
         cmds = []
+        # stagnation watchdog: pendings older than 45 s mean the probe never
+        # answered (e.g. TUI restart wrote cmdids below the running probe's
+        # last_cmdid — it skips those forever). Drop the dead pendings so the
+        # guards re-arm, and rebase the floor above every id the probe has
+        # ever answered (results file is the persistent record).
+        stale_cut = data["now"] - 45.0
+        stale = [cid for cid, t in self.pending_ts.items() if t < stale_cut]
+        if stale:
+            for cid in stale:
+                self._pop_pending(cid)
+            if self._result_cmdid_max > self._last_cmdid:
+                self._last_cmdid = self._result_cmdid_max
         ship_ts = (data.get("ship_state") or {}).get("ts")
         ts = parse_ts(ship_ts)
         stale = ts is None or (data["now"] - ts) > self.refresh_after
@@ -1401,11 +1460,14 @@ class Collector(object):
             cmds.append({"action": "planes"})
         # ghost discovery: helo/sub rows come from ns-style log lines; after
         # a mission restart the 400-line tail has none, so keep queueing one
-        # ns-dump every 10 cycles until a ghost style actually shows up
-        if not self._has_ghost_style() and \
-                self.cycle - self._last_nsdump_cycle >= 10:
-            cmds.append({"action": "ns-dump"})
-            self._last_nsdump_cycle = self.cycle
+        # ns-dump until a ghost style actually shows up — first 3 tries at a
+        # short cadence, then a relaxed one to keep the orders queue clean
+        if not self._has_ghost_style():
+            gap = 10 if self._nsdump_attempts < 3 else 30
+            if self.cycle - self._last_nsdump_cycle >= gap:
+                cmds.append({"action": "ns-dump"})
+                self._last_nsdump_cycle = self.cycle
+                self._nsdump_attempts += 1
         # detected scan: base cadence (>= 10 s) plus event trigger whenever
         # any element's signature changed (range/heading/assignment/...)
         due = self._detect_due or \
@@ -1441,6 +1503,7 @@ class Collector(object):
                 purposes.append("nsdump")
         for i, p in zip(ids, purposes):
             self.pending[i] = p
+            self.pending_ts[i] = data["now"]
 
     def _has_ghost_style(self):
         return any(s in ("helo", "plane/sub") for s in self.ns_styles.values())
@@ -1494,6 +1557,7 @@ class Collector(object):
         ids = self.send_commands([{"action": "detected"}])
         if ids:
             self.pending[ids[0]] = "detect"
+            self.pending_ts[ids[0]] = time.time()
             self._last_detect_ts = time.time()
             self._detect_due = False
             return True
@@ -1505,6 +1569,7 @@ class Collector(object):
         ids = self.send_commands([{"action": "ai-contacts"}])
         if ids:
             self.pending[ids[0]] = "contacts"
+            self.pending_ts[ids[0]] = time.time()
             return True
         return False
 
@@ -1514,6 +1579,7 @@ class Collector(object):
         ids = self.send_commands([{"action": "planes"}])
         if ids:
             self.pending[ids[0]] = "refresh"
+            self.pending_ts[ids[0]] = time.time()
             return True
         return False
 
@@ -1531,6 +1597,7 @@ class Collector(object):
         ids = self.send_commands([{"action": "ai-state", "id": int(target)}])
         if ids:
             self.pending[ids[0]] = "ext"
+            self.pending_ts[ids[0]] = time.time()
             return True
         return False
 
@@ -1719,8 +1786,10 @@ def run_curses(scr, collector, args):
         left_w = width - side_w
         head_txt = render_frame_lines(fr, left_w if side_w else width,
                                       sel=sel, detail=False)[0]
-        table_rows = (render_table(fr, left_w, sel=sel)[1:]
-                      if fr.get("elements") else [])
+        all_trows = (render_table(fr, left_w, sel=sel)
+                     if fr.get("elements") else [])
+        hdr_row = all_trows[0] if all_trows else None
+        table_rows = all_trows[1:]
         bar_w = (left_w if side_w else width) - 2
         threat_rows = render_threat_bar(fr, bar_w)
 
@@ -1739,16 +1808,18 @@ def run_curses(scr, collector, args):
         det_h = max(DETAIL_ROWS_BASE, (footer_y - y) // 2) if detail \
             else len(threat_rows) + 2
         avail = max(3, footer_y - det_h - y)
-        vis_n = max(3, min(len(table_rows), avail - 2))
+        vis_n = max(3, min(len(table_rows), avail - 3))
         vis[0] = vis_n
         total = len(table_rows)
         title = "AI CONTACTS"
         if total:
             title += " %d-%d/%d" % (offset + 1, min(offset + vis_n, total), total)
-        cy, cx, cw = _draw_box(scr, y, left_w, vis_n + 2, title, colors)
-        _draw_rows(scr, table_rows[offset:offset + vis_n], cy, cw,
+        cy, cx, cw = _draw_box(scr, y, left_w, vis_n + 3, title, colors)
+        if hdr_row is not None:
+            _draw_rows(scr, [hdr_row], cy, cw, colors, x0=cx)
+        _draw_rows(scr, table_rows[offset:offset + vis_n], cy + 1, cw,
                    colors, x0=cx, max_h=vis_n)
-        y += vis_n + 2
+        y += vis_n + 3
 
         if side_w and fr is not None:
             # right column runs from under the header down to the footer;
@@ -1873,7 +1944,7 @@ def main(argv=None):
     ap.add_argument("--detect-interval", type=float, default=10.0,
                     help="detected scan base cadence in seconds (min 10; also "
                          "fires early when an element's state changes)")
-    ap.add_argument("--asg-ttl", type=float, default=120.0, help="re-query asg after N seconds")
+    ap.add_argument("--asg-ttl", type=float, default=60.0, help="re-query asg after N seconds")
     args = ap.parse_args(argv)
 
     if args.remote:

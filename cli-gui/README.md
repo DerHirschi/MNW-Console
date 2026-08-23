@@ -67,9 +67,10 @@ that merges every known AI data source into one table — including command-only
 
 Panels (bordered): **OWN SHIP** (position/course/speed/depth, ordered helm/EOT/depth/
 RPM, masts, snorkel, towed, damage, ammo), **AI CONTACTS** (the table, scrollable,
-with range-window indicator in the title), **THREATS** (blackboard counts, detected-by
-list, contacts-on-player) — or **DETAIL #id** (TAB) with weapons DB match, ammo
-ratios, dipping sonar/rpm/throttle/altitude and per-element AI contacts.
+with range-window indicator in the title and a column header with units —
+`RANGE km`, `SPD kt`, `DEP m`, `BRG°`/`HDG°`), **THREATS** (blackboard counts,
+detected-by list, contacts-on-player) — or **DETAIL #id** (TAB) with weapons DB
+match, ammo ratios, dipping sonar/rpm/throttle/altitude and per-element AI contacts.
 
 At ≥ 100 columns OWN SHIP becomes a right-hand instrument column next to the table;
 narrower terminals stack it above.
@@ -106,20 +107,33 @@ right-hand column layout, the stacked layout and `--json`/text mode.
 ### Refresh model
 
 Input is decoupled from polling: keys react within ~150 ms; the data poll runs on its
-own interval timer. State files only refresh on the game's own cadence (~30–90 s), so
-the TUI drives updates through API commands (guarded against overlap): `planes` (no-op
-state refresh when state is stale), `detected` (base cadence `--detect-interval`,
-min 10 s, PLUS an immediate re-scan whenever any element's state signature changes:
-range/heading/speed/assignment/orders/prep/contact count), rotating `asg <id>` and
-`ai-state <id>` probes (TTL-based; command-only hosts included). Command-only hosts
-are discovered automatically via periodic `ns-dump`s until a helo/sub namespace shows
-up in the probe log. `cmdid`s stay monotonic even when the probe empties the orders
-file (collector-side floor). `--read-only` never writes `ship_orders.json`.
+own interval timer. **Real cadence (measured 2026-08-23):** the in-game `_random_tick_`
+hook fires at roughly 0.1–0.5 Hz depending on mission state and focus — NOT the
+~2.9/s quoted elsewhere for active gameplay. The probe's queue mode writes
+`ship_state.json` after every section run, so own-ship sections refresh every few
+ticks, but a full rotation including `ai` takes ~1–2 minutes: AI columns update about
+once per minute. That is probe/game-side physics, not a TUI limit.
 
-The `ai-state` action is **deployed live** (see
-`../ship-probe/BRIEF_ai_state_action.md`); helo/sub ghost rows fill in as the probes
-come back. If command-only hosts never answer the discovery `ns-dump`, that is a
-probe-side issue — tracked in `../ship-probe/BRIEF_ns_dump_multihost.md`
+The TUI drives extra freshness through API commands (guarded against overlap):
+`planes` (no-op state refresh when ship_state ts is older than 45 s), `detected`
+(base cadence `--detect-interval`, min 10 s, PLUS an immediate re-scan whenever any
+element's state signature changes: range/heading/speed/assignment/orders/prep/contact
+count), rotating `asg <id>` and `ai-state <id>` probes (TTL-based, default 60 s;
+command-only hosts included). Command-only hosts are discovered automatically via
+periodic `ns-dump`s until a helo/sub namespace shows up in the probe log — first 3
+tries at a short cadence, then relaxed to keep the orders queue clean.
+
+**cmdid contract:** ids stay monotonic even when the probe empties the orders file.
+The floor is `max(own history, highest cmdid ever answered in ship_results.json)`,
+and a stagnation watchdog drops pendings older than 45 s and rebases onto the
+results record — so a TUI restart cannot deadlock the channel against the running
+probe's in-RAM `last_cmdid` anymore (probe-side pruning tracked in
+`../ship-probe/BRIEF_orders_prune.md`). `--read-only` never writes `ship_orders.json`.
+
+The `ai-state` action is **deployed live** (see `../ship-probe/AGENTS.md`);
+helo/sub ghost rows fill in as the probes come back. If command-only hosts never
+answer the discovery `ns-dump`, that is a probe-side issue — tracked as task 2 in
+`../ship-probe/BRIEF_orders_prune.md`
 (multi-host answer + deterministic element enumeration).
 
 ### Usage

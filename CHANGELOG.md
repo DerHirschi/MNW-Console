@@ -1,5 +1,48 @@
 # Changelog
 
+## v2.4 (2026-08-23) — cli-gui: cmdid deadlock fix + table headers + NaN sanitizer
+
+Sync ship_probe + cli-gui/ from `masto/MNW-Tool/`. cli-gui fixes a TUI-restart
+cmdid deadlock, adds column headers with units, and sanitizes NaN/Inf in sonar
+tracks. ship_probe: disasm references cleaned (8 occurrences).
+
+### cli-gui/ai_tactical.py
+
+- **cmdid floor deadlock fix** — after a TUI restart the running probe keeps
+  `last_cmdid` in RAM; old sends used a floor from the TUI's own history only,
+  which fell below the probe's watermark → commands skipped forever. Floor now
+  uses `max(own history, highest cmdid ever answered in ship_results.json)`.
+- **Stagnation watchdog** — pendings older than 45 s are dropped and the floor
+  rebased onto the results record; guards re-arm immediately.
+- **detect-purpose pop** — `"detect"` pending is now properly removed on result
+  (was never popped, blocking subsequent detects).
+- **ns-dump throttle** — first 3 attempts at 10-cycle cadence, then relaxed to
+  30 cycles to reduce orders-queue pollution.
+- **Rotation TTLs 120 → 60 s** (`--asg-ttl` default).
+- **`_json_safe()` sanitizer** — recursively strips NaN/Inf from sonar track
+  passthrough structures; `--json` no longer crashes on bare `nan`/`inf`.
+- **Column headers with units** — `RANGE km`, `SPD kt`, `DEP m`, `BRG°`/`HDG°`
+  when column width allows; narrow columns fall back to plain abbreviations.
+  Header row is pinned (doesn't scroll with data).
+
+### cli-gui/tests/test_ai_tactical.py
+
+- 11 new tests: `TestCmdidFloor` (8 cases — floor, watchdog, detect-pop,
+  ns-dump throttle, TTL defaults), `TestTableHeader` (3 cases — units, hdr
+  style, text mode), `TestJsonSafe` (2 cases — recursive NaN/Inf stripping).
+  Suite: 76 green.
+
+### cli-gui/CHANGELOG.md
+
+- Two new entries: cmdid deadlock fix and column headers.
+
+### cli-gui/README.md
+
+- Refresh model section updated with measured cadence (0.1–0.5 Hz tick hook,
+  ~1–2 min full rotation). cmdid contract documented.
+
+---
+
 ## v2.3 (2026-08-23) — cli-gui: mast schematic with snorkel readout
 
 Sync cli-gui/ from `masto/MNW-Tool/cli-gui/`. Adds a sail-mast schematic to

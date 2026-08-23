@@ -5,6 +5,54 @@ Alle nennenswerten Änderungen dieses Teilprojekts. Format angelehnt an
 
 ## [Unreleased]
 
+### 2026-08-23 — ai_tactical: Command-Kanal-Deadlock nach TUI-Restart behoben
+
+**Ursache (live verifiziert):** Der Probe hält `last_cmdid` nur im RAM
+(17:01 gestartet, bis cmdid 39 verarbeitet). Nach einem TUI-Neustart schrieb
+die TUI wieder ab cmdid 0 — der Probe skippt IDs ≤ last_cmdid dauerhaft und
+entfernt sie nicht → Backlog ab 0 (18:13), kein Resultat mehr, DET-Spalte
+frisst das Stale-Flag nach ~60 s (`max(60, 2×interval)`).
+
+**Behoben**
+
+- **Floor-Rebase:** Ingest trackt `_result_cmdid_max` (höchste je
+  beantwortete cmdid aus `ship_results.json`); Sends flooren auf
+  `max(_last_cmdid, _result_cmdid_max)` → neue IDs landen immer über der
+  Probe-Historie, Kanal lebt sofort nach TUI-Restart weiter.
+- **Stagnations-Watchdog:** Pendings älter 45 s werden gedroppt (Guards
+  re-armen) und der Floor auf den Results-Max rebased.
+- **Bug #3:** Purpose `"detect"` wurde nie aus `pending` gepoppt — nach dem
+  ersten detected liefen alle weiteren automatisch leer. Zentrale
+  `_pop_pending()` räumt jetzt inkl. `pending_ts` auf.
+- **ns-dump-Bootstrap gedrosselt:** erste 3 Versuche im 10-Zyklen-Takt,
+  danach 30 (weniger Backlog-Verschmutzung bei Missionen ohne Helo/Sub).
+- **Rotation-TTLs 120 → 60 s** (`--asg-ttl` + Collector-Default).
+
+**Doku:** README „Refresh model" auf gemessene Realität korrigiert
+(Hook ~0,1–0,5 Hz hier; Sektionsrotation ~1–2 min ⇒ KI-Spalten ~1×/min;
+cmdid-Vertrag dokumentiert). Probe-seitiges Pruning angefordert:
+`../ship-probe/BRIEF_orders_prune.md`.
+
+**Zusätzlich (Live-Befund):** `--json` crashte an bare `nan`/`inf` in den
+Sonar-Passthrough-Tracks (`sonar.tracks[].range`, `.sensors[].range`) — neuer
+rekursiver `_json_safe()`-Sanitizer vor dem Dump; beide Ausgabepfade bleiben
+`allow_nan=False`. Regressionstests in `TestJsonSafe`.
+
+**Tests**: 8 neue (`TestCmdidFloor`) — Results-Floor, Watchdog-Rebase/
+Prune, detect-Pop, ns-dump-Drossel, TTL-Defaults. Suite: 76 grün.
+
+### 2026-08-23 — ai_tactical: Spalten-Header in der AI-CONTACTS-Tabelle
+
+- Der in `render_table()` bereits gebaute Header wurde im curses-`draw()`
+  per `[1:]` verworfen — er wird jetzt als erste Box-Innenzeile gezeigt und
+  scrollt nicht mit den Datenzeilen (Box `vis_n + 3`, Paging unverändert).
+- Header-Labels mit Einheiten, wo die Spaltenbreite reicht: `RANGE km`,
+  `SPD kt`, `DEP m`, `BRG°`/`HDG°`; schmale Spalten fallen deterministisch
+  auf die nackten Kürzel zurück.
+
+**Tests**: 3 neue (`TestTableHeader`) — Einheiten breit, hdr-Stil/Zeilen-
+breite über 40–140 Spalten, Textmodus behält Header. Suite: 66 grün.
+
 ### 2026-08-23 — ai_tactical: Mast-Schema im OWN-SHIP-Rahmen
 
 **Neu**

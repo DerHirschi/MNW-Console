@@ -801,5 +801,153 @@ class TestMastSchema(unittest.TestCase):
         self.assertTrue(any(t.startswith("┌") for t in lines))
 
 
+class TestCmdidFloor(unittest.TestCase):
+    """TUI restart vs running probe: cmdid floor must include results history."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aitac_floor_")
+        with open(os.path.join(self.tmp, "ship_results.json"), "w") as f:
+            json.dump({"ts": "2026-08-23 17:44:43", "results": [
+                {"cmdid": 12, "action": "detected", "ts": "18:00:00"},
+                {"cmdid": 39, "action": "ai-state", "ts": "17:44:43"}]}, f)
+        with open(os.path.join(self.tmp, "ship_orders.json"), "w") as f:
+            json.dump({"commands": [{"action": "ns-dump", "cmdid": i}
+                                    for i in range(3)]}, f)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _orders_last_id(self):
+        data = json.load(open(os.path.join(self.tmp, "ship_orders.json")))
+        return data["commands"][-1]["cmdid"]
+
+    def test_ingest_tracks_result_cmdid_max(self):
+        col = at.Collector(at.LocalSource(self.tmp))
+        col.poll_once()
+        self.assertEqual(col._result_cmdid_max, 39)
+
+    def test_send_lands_above_result_history(self):
+        col = at.Collector(at.LocalSource(self.tmp))
+        col.poll_once()
+        ids = col.send_commands([{"action": "detected"}])
+        # poll_once already queued refresh/detect/nsdump -> id continues
+        # above them, but ALWAYS above the results history (39)
+        self.assertGreater(ids[0], 39)
+        self.assertEqual(self._orders_last_id(), ids[0])
+
+    def test_module_send_ignores_results_without_collector(self):
+        ids = at.send_commands(at.LocalSource(self.tmp),
+                               [{"action": "planes"}], floor=-1)
+        self.assertEqual(ids, [3])            # orders max 2 + 1
+
+    def test_watchdog_rebases_and_prunes_stale_pendings(self):
+        col = at.Collector(at.LocalSource(self.tmp))
+        col.pending[7] = "detect"
+        col.pending_ts[7] = time.time() - 60
+        col._last_cmdid = 5
+        col.poll_once()
+        self.assertNotIn(7, col.pending)
+        # rebased above results history (39); poll_once's own sends may
+        # have pushed it further, but never below the rebase point
+        self.assertGreaterEqual(col._last_cmdid, 39)
+
+    def test_watchdog_quiet_when_fresh(self):
+        col = at.Collector(at.LocalSource(self.tmp))
+        col.pending[8] = "asg"
+        col.pending_ts[8] = time.time()
+        col.poll_once()
+        self.assertIn(8, col.pending)
+
+    def test_detect_purpose_popped_on_result(self):
+        col = at.Collector(at.LocalSource(self.tmp))
+        col.pending[12] = "detect"
+        col.pending_ts[12] = time.time()
+        col.poll_once()
+        self.assertNotIn(12, col.pending)
+
+    def test_nsdump_throttles_after_three_attempts(self):
+        orig = at.send_commands
+        seen = []
+        at.send_commands = lambda src_, c, floor=-1: (
+            seen.extend(c) or list(range(100, 100 + len(c))))
+        try:
+            col = at.Collector(at.LocalSource(self.tmp))
+            data = {"now": time.time(), "ship_state": {},
+                    "ai_state": {"elements": []}}
+            for cycle in (1, 11, 21):         # short cadence while attempts < 3
+                col.cycle = cycle
+                col._queue_commands(data)
+            self.assertEqual(sum(1 for c in seen
+                                 if c.get("action") == "ns-dump"), 3)
+            seen[:] = []
+            col.cycle = 31                    # inside the relaxed 30-cycle gap
+            col._queue_commands(data)
+            self.assertNotIn("ns-dump", [c.get("action") for c in seen])
+            col.cycle = 51
+            col._queue_commands(data)
+            self.assertEqual([c.get("action") for c in seen]
+                             .count("ns-dump"), 1)
+        finally:
+            at.send_commands = orig
+
+    def test_ttl_defaults_sixty(self):
+        col = at.Collector(at.LocalSource(self.tmp))
+        self.assertEqual(col.asg_ttl, 60.0)
+        self.assertEqual(col.ext_ttl, 60.0)
+
+
+class TestTableHeader(unittest.TestCase):
+    def setUp(self):
+        self.frame = at.build_frame({
+            "ship_state": ship_state_fixture(),
+            "ai_state": ai_state_fixture(), "now": time.time()})
+
+    def test_header_units_wide(self):
+        txt = at.flatten(at.render_table(self.frame, 100))[0]
+        for unit in ("RANGE km", "SPD kt", "DEP m", "BRG\u00b0", "HDG\u00b0"):
+            self.assertIn(unit, txt)
+
+    def test_header_first_row_hdr_style(self):
+        rows = at.render_table(self.frame, 80)
+        self.assertEqual(rows[0][0][1], "hdr")
+        for w in range(40, 145, 5):     # never wider than the box, no crash
+            row = at.render_table(self.frame, w)[0]
+            self.assertLessEqual(sum(len(t) for t, _ in row), max(w, 45))
+
+    def test_textmode_keeps_header(self):
+        lines = at.flatten(at.render_frame_lines(self.frame, 90))
+        self.assertTrue(any(l.lstrip().startswith("ID") and "NAME" in l
+                            for l in lines))
+
+
+class TestJsonSafe(unittest.TestCase):
+    """Sonar pass-through tracks carry bare nan/inf live; strict JSON
+    output (allow_nan=False) must never see them."""
+
+    def _frame(self, ship):
+        return at.build_frame({"ship_state": ship})
+
+    def test_nan_inf_stripped_recursively(self):
+        ss = ship_state_fixture()
+        ss["sonar"] = {"count": 2, "tracks": [
+            {"id": "T1", "range": float("nan"),
+             "sensors": [{"range": float("nan"), "bearing": 12.5}]},
+            {"id": "T2", "range": float("inf"), "bearing": 45},
+        ]}
+        fr = self._frame(ss)
+        tracks = fr["sonar"]["tracks"]
+        self.assertIsNone(tracks[0]["range"])
+        self.assertIsNone(tracks[0]["sensors"][0]["range"])
+        self.assertAlmostEqual(tracks[0]["sensors"][0]["bearing"], 12.5)
+        self.assertIsNone(tracks[1]["range"])
+        self.assertEqual(tracks[1]["bearing"], 45)
+        json.dumps(fr, allow_nan=False)     # must not raise
+
+    def test_no_sonar_section(self):
+        fr = self._frame(ship_state_fixture())
+        # fixture has no sonar section -> passthrough stays falsy
+        self.assertFalse(fr["sonar"]["tracks"])
+
+
 if __name__ == "__main__":
     unittest.main()
