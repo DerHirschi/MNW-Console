@@ -46,8 +46,14 @@ _RESULTS_NAME = "ship_results.json"
 _RESULTS_KEEP = 300
 # While a section generator (sonar_arrays) is mid-slice, nothing would
 # otherwise be written for its whole wall-clock duration. Flush a partial
-# snapshot at least this often so instruments never black out.
-_MID_SLICE_FLUSH_S = 2.0
+# snapshot at least this often so instruments never black out. 1.2 s keeps
+# the worst observed gap near ~3 s given _random_tick_ spacing of 0.4-1.8 s
+# (BRIEF_scheduler_fairness A: criterion <=2.5 s typical, 4.0 s at 2.0).
+_MID_SLICE_FLUSH_S = 1.2
+# A section whose measured average reader cost is above this many ms never
+# co-runs alongside an active slice job (BRIEF_scheduler_fairness B):
+# couriers must stay invisible on the game thread.
+_SLICE_COURIER_MAX_MS = 4.0
 # read_ai_elements is a full element pass (detect_player + player_navigation +
 # per-element reads); skip it when the last ai_state.json write is younger -
 # the bursty double-update within ~11 s was pure waste (BRIEF Auftrag 3c).
@@ -76,6 +82,10 @@ _DEFAULTS = {
     "collect_mode": "queue",
     "sections_per_tick": 1,
     "section_slice_ms": 6.0,
+    # Deadline scheduling (BRIEF_scheduler_fairness B): while a generator
+    # section is mid-slice, overdue TINY sections (measured reader cost
+    # <= _SLICE_COURIER_MAX_MS) may run alongside it, one per pump.
+    "slice_courier": True,
     "read_identity": True,
     "read_navigation": True,
     "read_blackboard": True,
@@ -102,14 +112,16 @@ _DEFAULTS = {
 # Rotating section queue for collect_mode="queue" (2026-08-23). Each entry is
 # (section_name, reader_method_name, default_interval_in_acted_ticks). Order =
 # priority: cheap/high-frequency sections first, heavy killers last. Each acted
-# tick runs at most sections_per_tick entries whose interval has elapsed; the
-# result is written into ship_state.json IMMEDIATELY (partial state, no full
-# round wait). Intervals can be overridden per-section via the config key
-# "section_interval" {name: ticks}. C# call cost per section (measured live):
+# Deadline scheduler (BRIEF_scheduler_fairness B, replaces fixed rotation):
+# each tick the MOST OVERDUE section runs first - overdue = seconds since its
+# last run minus its interval. Intervals are SECONDS and can be overridden per
+# section via "section_interval" {name: seconds} (legacy tick-tuned numbers
+# carry over). C# call cost per section (measured live):
 #   clock ~2, identity ~10, navigation ~30, blackboard 11, contacts <=650,
 #   sonar <=100, steering ~25, systems <=250, ai mostly-py, mission ~5,
 #   sonar_arrays <=1480 (~216 ms wall - TIME-SLICED via iter_sonar_arrays
-#   generator: pumped max section_slice_ms per tick until done).
+#   generator: pumped max section_slice_ms per tick until done; tiny overdue
+#   sections courier alongside it, see slice_courier).
 _SECTION_DEFS = (
     ("clock",        "read_clock_section",     1),
     ("navigation",   "read_navigation",        1),
@@ -624,12 +636,13 @@ class _Probe(object):
         # no full-round wait). Consumers render missing sections as "?" until
         # the first rotation completes.
         self._partial_state = {}
-        self._section_idx = 0
-        self._section_last_run = {}
+        self._section_last_wall = {}   # name -> time.time() of last run
+        self._sec_cost_ema = {}        # name -> reader cost EMA (seconds)
         self._sections_collected = set()
         self._section_ts = {}
         self._acted_count = 0
         self._last_act_monotonic = 0.0
+        self._last_sched_log_mono = 0.0
         self.perf_marks = {}
         # Background state writer (2026-08-23): measured live, the synchronous
         # ship_state.json write blocked the game thread ~57 ms per acted tick
@@ -2682,6 +2695,11 @@ class _Probe(object):
     # ---------------------------------------------------------------
 
     def _section_interval(self, name, default):
+        """Configured interval for a section in SECONDS (BRIEF_scheduler_
+        fairness B: intervals used to count acted ticks, but the tick rate
+        swings ~0.1-2 Hz live, which made tick-count intervals meaningless
+        and caused burst/starve patterns). Existing config values carry over
+        numerically - they were tuned when ticks ran at roughly 1 Hz."""
         iv = self.cfg.get("section_interval")
         if isinstance(iv, dict):
             try:
@@ -2692,40 +2710,53 @@ class _Probe(object):
                 pass
         return max(1, int(default))
 
+    def _bump_cost(self, name, dt):
+        """Track a rolling average of a section reader's wall-clock cost so
+        courier eligibility does not depend on measure_perf being on."""
+        prev = self._sec_cost_ema.get(name)
+        self._sec_cost_ema[name] = dt if prev is None else prev * 0.7 + dt * 0.3
+
     def _collect_next_section(self):
-        """Run at most sections_per_tick queue entries whose interval has
-        elapsed. Each completed section is merged into _partial_state and the
-        FULL partial state is written to ship_state.json immediately (no
-        full-round wait). Sections whose reader returns a GENERATOR are
-        time-sliced: the generator is pumped up to section_slice_ms per tick
-        until it finishes (sonar_arrays ~216 ms -> <=6 ms chunks). A running
-        slice job owns the tick; no other sections start meanwhile.
+        """Run at most sections_per_tick entries picked by DEADLINE: every
+        enabled section whose interval has elapsed is a candidate and the
+        MOST OVERDUE one goes first (BRIEF_scheduler_fairness B - replaces
+        the old fixed rotation whose tick-count intervals produced bursts).
+        Sections that never ran lead in _SECTION_DEFS order until the initial
+        fill completes. Each completed section merges into _partial_state and
+        the FULL partial state is written immediately. Generator readers
+        become slice jobs; a running slice job owns the tick (tiny overdue
+        sections may courier alongside it, see _maybe_courier_section).
         Returns True if any section work happened."""
-        # resume an in-flight sliced section first - it owns this tick
         if self._slice_job is not None:
             self._pump_slice()
             return True
-        ran_any = False
+        now = time.time()
+        cands = []
+        for idx, (name, meth_name, default_iv) in enumerate(_SECTION_DEFS):
+            if not self.cfg.get("read_%s" % name, True):
+                continue
+            if getattr(self, meth_name, None) is None:
+                continue
+            last = self._section_last_wall.get(name)
+            if last is None:
+                late = float("inf")     # initial fill leads, defs order ties
+            else:
+                late = now - last - self._section_interval(name, default_iv)
+                if late <= 0:
+                    continue            # not due yet
+            cands.append((-late, idx, name, meth_name))
+        if not cands:
+            return False
+        cands.sort()
         budget = max(1, int(self.cfg.get("sections_per_tick", 1)))
-        n_defs = len(_SECTION_DEFS)
-        for _ in range(n_defs):
+        ran_any = False
+        for _neg_late, _idx, name, meth_name in cands:
             if budget <= 0:
                 break
-            name, meth_name, default_iv = _SECTION_DEFS[self._section_idx]
-            self._section_idx = (self._section_idx + 1) % n_defs
-            cfg_key = "read_%s" % name
-            if not self.cfg.get(cfg_key, True):
-                continue
-            last = self._section_last_run.get(name)
-            if last is not None and (self._acted_count - last) < self._section_interval(name, default_iv):
-                continue
-            fn = getattr(self, meth_name, None)
-            if fn is None:
-                continue
-            self._section_last_run[name] = self._acted_count
             t0 = time.time()
+            self._section_last_wall[name] = t0
             try:
-                res = fn()
+                res = getattr(self, meth_name)()
                 if hasattr(res, "send") and hasattr(res, "__next__"):
                     # generator -> time-sliced across ticks (anti-stutter)
                     self._slice_job = [name, res, 0.0]
@@ -2736,6 +2767,7 @@ class _Probe(object):
             except Exception as e:
                 self.note_error("section_" + name, e)
                 self._partial_state[name] = {"err": _desc(e, 100)}
+            self._bump_cost(name, time.time() - t0)
             self.note_perf("sec_" + name, time.time() - t0)
             self._sections_collected.add(name)
             self._section_ts[name] = time.time()
@@ -2776,15 +2808,93 @@ class _Probe(object):
         acc += time.time() - t0
         if not done:
             self._slice_job = [name, gen, acc]
+            # courier first: its flush refreshes _last_state_flush_mono, so a
+            # redundant mid-slice flush in the same tick is skipped
+            self._maybe_courier_section()
             self._maybe_mid_slice_flush()
             return
         self.note_perf("sec_" + name, acc)
+        self._bump_cost(name, acc)
         if isinstance(result, dict):
             self._partial_state[name] = result
         self._sections_collected.add(name)
         self._section_ts[name] = time.time()
         self._slice_job = None
         self._flush_partial_state()
+
+    def _maybe_courier_section(self):
+        """Run ONE overdue tiny section alongside the active slice job
+        (BRIEF_scheduler_fairness B): without it a long sonar_arrays pass
+        starves every other section for its whole wall-clock duration.
+        Eligible: has run before, overdue by more than 2x its interval, and
+        measured reader cost <= _SLICE_COURIER_MAX_MS (clock/navigation/
+        blackboard/ai qualify; sonar_arrays is excluded as the only known
+        generator). At most one courier per pump keeps slice chunks intact."""
+        job = self._slice_job
+        if job is None or not self.cfg.get("slice_courier", True):
+            return False
+        now = time.time()
+        best = None
+        for idx, (name, meth_name, default_iv) in enumerate(_SECTION_DEFS):
+            if name == job[0]:
+                continue
+            if not self.cfg.get("read_%s" % name, True):
+                continue
+            last = self._section_last_wall.get(name)
+            if last is None:
+                continue        # never ran -> initial fill handles it
+            iv = self._section_interval(name, default_iv)
+            over = now - last - iv
+            if over <= iv:      # need overdue > 2x interval
+                continue
+            cost = self._sec_cost_ema.get(name)
+            if cost is not None and cost * 1000.0 > _SLICE_COURIER_MAX_MS:
+                continue
+            cand = (-over, idx)
+            if best is None or cand < best[0]:
+                best = (cand, name, meth_name)
+        if best is None:
+            return False
+        _cand, name, meth_name = best
+        t0 = time.time()
+        self._section_last_wall[name] = t0
+        try:
+            res = getattr(self, meth_name)()
+            if isinstance(res, dict):
+                self._partial_state[name] = res
+        except Exception as e:
+            self.note_error("courier_" + name, e)
+            self._partial_state[name] = {"err": _desc(e, 100)}
+        self._bump_cost(name, time.time() - t0)
+        self.note_perf("courier_" + name, time.time() - t0)
+        self._sections_collected.add(name)
+        self._section_ts[name] = time.time()
+        self._flush_partial_state()
+        return True
+
+    def _log_sched_state(self):
+        """measure_perf diagnostic (BRIEF_scheduler_fairness): one compact
+        line per acted tick (rate-limited to 1/s) naming the most overdue
+        sections, e.g. 'sched: ai late=14.2 clock late=3.1'."""
+        if not self.cfg.get("measure_perf"):
+            return
+        now_mono = time.monotonic()
+        if now_mono - self._last_sched_log_mono < 1.0:
+            return
+        self._last_sched_log_mono = now_mono
+        now = time.time()
+        parts = []
+        for name, _meth, default_iv in _SECTION_DEFS:
+            last = self._section_last_wall.get(name)
+            if last is None:
+                continue
+            late = now - last - self._section_interval(name, default_iv)
+            if late > 1.0:
+                parts.append("%s late=%.1f" % (name, late))
+        if self._slice_job is not None:
+            parts.append("running=%s" % self._slice_job[0])
+        if parts:
+            self.emit("sched: " + " ".join(parts))
 
     def _flush_partial_state(self):
         """Build the full partial-state snapshot and hand it to the background
@@ -6799,6 +6909,10 @@ class _Probe(object):
                 self._collect_next_section()
             except Exception as e:
                 self.note_error("tick_sections", e)
+            try:
+                self._log_sched_state()
+            except Exception:
+                pass
         try:
             self.dispatch_orders()
         except Exception as e:

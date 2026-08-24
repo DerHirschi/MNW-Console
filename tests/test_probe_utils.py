@@ -2145,13 +2145,13 @@ class SonarArraysTest(unittest.TestCase):
     class FakeCM(object):
         Player = _FakeInfo()
 
-    def _probe(self, tmp, controller, read_arrays=True):
+    def _probe(self, tmp, controller, read_arrays=True, full_contacts=False):
         cfg = dict(log_dir=tmp, tick_delay=1, heartbeat_every=120, console_log=False,
                    require_player=True, target_element_id=0, max_contacts=50,
                    max_commands_per_cycle=10, allow_commands=[], resolve_positions=True,
                    state_every=10, read_contacts=False, read_sonar=False,
                    read_sonar_arrays=read_arrays, max_sonar_arrays=8,
-                   max_sonar_contacts=20)
+                   max_sonar_contacts=20, sonar_contacts_full=full_contacts)
         host = {"__name__": "sub", "__file__": "sub.py",
                 "_Information": _FakeInfo(), "_Controller": object(),
                 "client": type("C", (), {"_CoordinatesManager": self.FakeCM()})()}
@@ -2199,9 +2199,9 @@ class SonarArraysTest(unittest.TestCase):
         probe = None
         try:
             sensor = SonarArraysTest.FakeSensor([SonarArraysTest.FakeContact(),
-                                                 SonarArraysTest.FakeContact()])
+                                                  SonarArraysTest.FakeContact()])
             sys = self._sys([sensor])
-            probe = self._probe(tmp, SonarArraysTest.FakeController(sys))
+            probe = self._probe(tmp, SonarArraysTest.FakeController(sys), full_contacts=True)
             out = probe.read_sonar_arrays()
             self.assertIsNone(out["err"])
             self.assertEqual(len(out["arrays"]), 1)

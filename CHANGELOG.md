@@ -1,5 +1,39 @@
 # Changelog
 
+## v2.7 (2026-08-24) — Deadline scheduler + courier sections
+
+Sync ship_probe + cli-gui from `masto/MNW-Tool/`. Replaces the fixed-rotation
+section queue with a deadline scheduler that always runs the most overdue
+section first, plus a courier mechanism to keep tiny sections alive during long
+generator slices. Config unchanged.
+
+### ship_probe.py
+
+- **Deadline scheduler** — `_collect_next_section()` now builds a candidate list
+  of overdue sections (elapsed time > interval), sorts by lateness, and runs the
+  most overdue first. Replaces the old round-robin index rotation whose tick-
+  count intervals produced burst/starve patterns at variable tick rates.
+- **`_SLICE_COURIER_MAX_MS = 4.0`** — while a generator section (sonar_arrays)
+  is mid-slice, one overdue tiny section (measured cost ≤ 4 ms) may run
+  alongside it per pump. Prevents clock/navigation/blackboard starvation during
+  long sonar_arrays passes (~216 ms). Controlled by `slice_courier` config
+  (default true).
+- **`_MID_SLICE_FLUSH_S` tightened 2.0 → 1.2** — fits the measured `_random_tick_`
+  spacing of 0.4–1.8 s; keeps worst-case instrument blackout near ~2.5 s.
+- **Cost EMA** (`_sec_cost_ema`) — rolling average of each section reader's
+  wall-clock cost drives courier eligibility without requiring `measure_perf`.
+- **`_log_sched_state()`** — diagnostic (rate-limited 1/s) showing the most
+  overdue sections and any running slice job.
+- **disasm references cleaned** (8 occurrences).
+
+### Tests
+
+- SonarArraysTest `test_enumerates_arrays_and_contacts` updated to use
+  `full_contacts=True` (new default is slim mode — 9 fields instead of 16).
+  Suite: 257 + 88 = 345 green.
+
+---
+
 ## v2.6 (2026-08-23) — Performance: mid-slice flush, slim sonar, AI dampening + PROBE BUSY
 
 Sync ship_probe + cli-gui from `masto/MNW-Tool/`. Three probe-side performance

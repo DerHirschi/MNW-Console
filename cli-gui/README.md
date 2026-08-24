@@ -134,7 +134,10 @@ When the game stops handing ticks to the probe (measured 7–12 s holes), all da
 freezes at once. The TUI then shows an amber `PROBE BUSY - no fresh data for Ns`
 banner under the header until `ship_state` refreshes again (> 15 s age triggers it).
 Probe-side mitigations (incremental writes while slicing, slim sonar contacts,
-AI write dampening) are specified as task 3 in `BRIEF_orders_prune.md`.
+AI write dampening) are specified as task 3 in `BRIEF_orders_prune.md`; the
+follow-up scheduling work (flush during slice jobs, due-first section
+scheduling on a seconds basis) is specified in
+`../ship-probe/BRIEF_scheduler_fairness.md`.
 
 The `ai-state` action is **deployed live** (see `../ship-probe/AGENTS.md`);
 helo/sub ghost rows fill in as the probes come back. If command-only hosts never
@@ -153,10 +156,13 @@ python3 ai_tactical.py --remote '...' --json --count 30                # NDJSON 
 
 Keys: `q` quit · `↑/↓` select · TAB detail · `d` detect now · `e` ai-state probe ·
 `a` ai-contacts now · `r` force refresh · `p` pause · `+/-` interval · `c` toggle color.
+`A` + `y` queues an ai-attack on the selected element (probe refuses when the
+element has no track on the player); `B` + `y` fires blind (`allow_untracked`,
+overrides the gate). The last attack's outcome shows as a banner for ~12 s.
 Flags: `--count N`, `--no-color`, `--read-only`, `--detect-interval S` (min 10),
 `--asg-ttl S`.
 
-Tests: `tests/test_ai_tactical.py` (52 cases: parsers, merge incl. own-id filter and
+Tests: `tests/test_ai_tactical.py` (88 cases: parsers, merge incl. own-id filter and
 ext-state fill, own-ship panel + side column, renderers incl. kt conversion,
 narrow widths, NaN sanitization, strict-JSON round-trip, monotonic cmdid floor,
 detect scheduling + event trigger, ns-dump bootstrap).

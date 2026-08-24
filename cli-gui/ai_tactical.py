@@ -44,6 +44,8 @@ cold start; their ai-state is then probed in rotation.
 Keys: q quit | p pause | +/- interval | up/down select | TAB detail expand
       d detect now | e ai-state probe | a ai-contacts sweep
       r force state refresh | c colors
+      A queue ai-attack on the selected element (y confirms)
+      B queue BLIND ai-attack (allow_untracked; y confirms)
 
 Layout: >= 100 cols shows OWN SHIP as a right-hand instrument column;
 narrower terminals stack it above the table.
@@ -1329,6 +1331,8 @@ class Collector(object):
         self.sigs = {}                 # eid -> last seen element signature
         self._last_nsdump_cycle = -1000
         self._nsdump_attempts = 0
+        # last manual ai-attack outcome (key A/B feedback banner)
+        self.attack_status = None
 
     def send_commands(self, cmds):
         """Guarded write path: no-op list in read_only mode."""
@@ -1432,6 +1436,22 @@ class Collector(object):
                 detail = r.get("detail") or []
                 self.ns_styles.update(parse_ns_styles(detail))
                 self._pop_pending(cid)
+            elif purpose == "ai-attack" or action == "ai-attack":
+                # answered: surface the outcome (key A/B feedback) - the
+                # result string carries either "PushOrder ok ..."/"Engage
+                # created ..." or the refusal reason
+                ok = str(r.get("ok", "")).lower() == "true"
+                msg = str(r.get("result") or "")
+                if not msg:
+                    det = r.get("detail") or []
+                    if det:
+                        msg = "; ".join(str(x) for x in det[-2:])
+                if purpose == "ai-attack":
+                    self._pop_pending(cid)
+                self.attack_status = {
+                    "cmdid": cid, "ok": ok, "msg": msg[:120],
+                    "ts_epoch": time.time(),
+                }
         if newest_det is not None:
             age = None
             ts = parse_ts(newest_det.get("ts"))
@@ -1607,6 +1627,25 @@ class Collector(object):
             return True
         return False
 
+    def queue_ai_attack(self, eid, allow_untracked=False):
+        """Manual strike order on the selected element: writes
+        {"action":"ai-attack","id":N} via the guarded send path. The probe's
+        do_ai_attack runs the heavy C# work on its own host (multi-host safe,
+        ownership-checked); this only queues and tracks the cmdid.
+        allow_untracked=true fires blind (probe's track gate is skipped) -
+        bound to key B; key A keeps the safe refuse-if-untracked behavior."""
+        if self.read_only or eid is None or int(eid) <= 0:
+            return False
+        cmd = {"action": "ai-attack", "id": int(eid)}
+        if allow_untracked:
+            cmd["allow_untracked"] = True
+        ids = self.send_commands([cmd])
+        if ids:
+            self.pending[ids[0]] = "ai-attack"
+            self.pending_ts[ids[0]] = time.time()
+            return True
+        return False
+
     def _element_sig(e):
         """Compact change signature of one raw ai_state element."""
         km = _num(e.get("to_player_range_km"))
@@ -1769,7 +1808,7 @@ def _draw_box(scr, y0, width, height, title, colors=True, x0=0):
     return y0 + 1, x0 + 1, width - 2
 
 
-HELP_LINE = " q quit | \u2191\u2193 sel | TAB detail | d detect | e ai-state | a contacts | r refresh | p pause | +/- intv | c color "
+HELP_LINE = " q quit | \u2191\u2193 sel | TAB detail | d detect | e ai-state | a contacts | r refresh | p pause | +/- intv | c color | A attack | B blind "
 
 PROBE_BUSY_S = 15.0
 
@@ -1885,6 +1924,20 @@ def run_curses(scr, collector, args):
                         _attr("dim", colors))
         except curses.error:
             pass
+        # last manual ai-attack outcome (keys A/B): show for ~12 s
+        st = collector.attack_status
+        if st and time.time() - st.get("ts_epoch", 0) < 12.0:
+            mark = "OK" if st.get("ok") else "FAILED"
+            line = " ATTACK #%s %s : %s " % (
+                st.get("cmdid"), mark, st.get("msg") or "")
+            style = "green" if st.get("ok") else "red"
+            attr = _attr(style, colors) if colors else \
+                (curses.A_BOLD if st.get("ok") else
+                 curses.A_REVERSE | curses.A_BOLD)
+            try:
+                scr.addnstr(h - 2, 0, line[:width - 1], width - 1, attr)
+            except curses.error:
+                pass
         scr.refresh()
 
     sel = 0
@@ -1943,6 +1996,31 @@ def run_curses(scr, collector, args):
             collector.force_refresh()
         elif ch == ord("c"):
             colors = not colors
+        elif ch in (ord("A"), ord("B")):
+            # manual ai-attack on the selected element - two-step confirm so
+            # a stray keypress cannot fire heavy C# work on the game host.
+            # A = safe (refused when the element has no track on player),
+            # B = blind (allow_untracked:true overrides the probe's gate)
+            blind = ch == ord("B")
+            if nels:
+                e = frame["elements"][sel]
+                msg = " AI-ATTACK%s %s #%d : %sy = fire, any other = cancel " % (
+                    "-BLIND" if blind else "", e.get("name") or "?", e["id"],
+                    "UNTRACKED OK! " if blind else "")
+                draw(frame, sel, offset, detail)
+                try:
+                    h2, w2 = scr.getmaxyx()
+                    scr.addnstr(h2 - 1, 0, msg[:w2 - 1], w2 - 1,
+                                curses.A_REVERSE | curses.A_BOLD)
+                    scr.refresh()
+                except curses.error:
+                    pass
+                scr.timeout(5000)
+                ch2 = scr.getch()
+                scr.timeout(150)
+                if ch2 == ord("y"):
+                    collector.queue_ai_attack(e["id"],
+                                              allow_untracked=blind)
         # scroll window follows the selection using the real visible row count
         if nels and sel < offset:
             offset = sel

@@ -429,6 +429,93 @@ class TestSourcesAndCommands(unittest.TestCase):
         json.dumps(f, allow_nan=False, default=str)
 
 
+class TestAiAttackCommand(unittest.TestCase):
+    """Manual ai-attack trigger (BRIEF_scheduler_fairness follow-up): 'A'
+    arms the selected element, 'y' queues {"action":"ai-attack","id":N}."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aitac_atk_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_queue_writes_payload_and_tracks_pending(self):
+        col = at.Collector(at.LocalSource(self.tmp))
+        self.assertTrue(col.queue_ai_attack(14))
+        orders_path = os.path.join(self.tmp, "ship_orders.json")
+        with io.open(orders_path) as f:
+            data = json.load(f)
+        self.assertEqual(data["commands"],
+                         [{"action": "ai-attack", "id": 14, "cmdid": 0}])
+        self.assertEqual(col.pending.get(0), "ai-attack")
+
+    def test_read_only_never_writes(self):
+        col = at.Collector(at.LocalSource(self.tmp), read_only=True)
+        self.assertFalse(col.queue_ai_attack(14))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp, "ship_orders.json")))
+
+    def test_rejects_invalid_ids(self):
+        col = at.Collector(at.LocalSource(self.tmp))
+        for bad in (None, 0, -3):
+            self.assertFalse(col.queue_ai_attack(bad))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp, "ship_orders.json")))
+
+    def test_answered_result_releases_pending(self):
+        col = at.Collector(at.LocalSource(self.tmp))
+        col.queue_ai_attack(14)
+        with io.open(os.path.join(self.tmp, "ship_results.json"), "w") as f:
+            json.dump({"results": [{"cmdid": 0, "action": "ai-attack",
+                                    "ts": "12:00:00", "detail": []}]}, f)
+        col.poll_once()
+        self.assertNotIn(0, col.pending)
+
+    def test_untracked_payload_for_blind_attack(self):
+        col = at.Collector(at.LocalSource(self.tmp))
+        self.assertTrue(col.queue_ai_attack(14, allow_untracked=True))
+        orders_path = os.path.join(self.tmp, "ship_orders.json")
+        with io.open(orders_path) as f:
+            data = json.load(f)
+        self.assertEqual(data["commands"],
+                         [{"action": "ai-attack", "id": 14,
+                           "allow_untracked": True, "cmdid": 0}])
+        # plain A stays without the flag
+        col2 = at.Collector(at.LocalSource(self.tmp))
+        col2.queue_ai_attack(14)
+        with io.open(orders_path) as f:
+            data = json.load(f)
+        self.assertNotIn("allow_untracked", data["commands"][-1])
+
+    def test_ingest_success_sets_attack_status(self):
+        col = at.Collector(at.LocalSource(self.tmp), read_only=True)
+        with io.open(os.path.join(self.tmp, "ship_results.json"), "w") as f:
+            json.dump({"results": [{"cmdid": 7, "action": "ai-attack",
+                                    "ts": "12:00:00",
+                                    "result": "PushOrder ok (tactical=17 assignment=98)",
+                                    "ok": True}]}, f)
+        col.poll_once()
+        st = col.attack_status
+        self.assertIsNotNone(st)
+        self.assertEqual(st["cmdid"], 7)
+        self.assertTrue(st["ok"])
+        self.assertIn("assignment=98", st["msg"])
+
+    def test_ingest_refusal_sets_failed_status(self):
+        col = at.Collector(at.LocalSource(self.tmp), read_only=True)
+        with io.open(os.path.join(self.tmp, "ship_results.json"), "w") as f:
+            json.dump({"results": [{"cmdid": 9, "action": "ai-attack",
+                                    "ts": "12:01:00",
+                                    "result": "RuntimeError: no contact on "
+                                              "player — refusing blind attack",
+                                    "ok": False}]}, f)
+        col.poll_once()
+        st = col.attack_status
+        self.assertIsNotNone(st)
+        self.assertFalse(st["ok"])
+        self.assertIn("refusing blind", st["msg"])
+
+
 class TestOwnShipAndExt(unittest.TestCase):
     def test_own_element_ids(self):
         ss = ship_state_fixture()

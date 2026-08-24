@@ -5,6 +5,51 @@ Alle nennenswerten Änderungen dieses Teilprojekts. Format angelehnt an
 
 ## [Unreleased]
 
+### 2026-08-24 — ai_tactical: Attack-Feedback-Banner + Taste B (Blindangriff)
+
+**Befund (live, 07:08–07:12):** Die ersten fünf manuellen Attacks liefen
+game-seitig durch (`PushOrder ok`, assignments 89–98) — die TUI zeigte es
+aber nicht. Danach verweigerte der Probe den Angriff mit
+`no contact on player — refusing blind attack` (Safety-Gate: das Element
+hatte keinen aktiven Track mehr auf den Player; der Agent umging das
+früher per `allow_untracked:true`). Beides war aus der TUI unsichtbar.
+
+**Neu**
+
+- **Feedback-Banner:** ai-attack-Antworten werden in `_ingest_results`
+  ausgewertet (`ok` + `result`-String); `draw()` zeigt den letzten Ausgang
+  ~12 s über dem Footer — `ATTACK #N OK : PushOrder ok ...` grün bzw.
+  `ATTACK #N FAILED : RuntimeError: no contact on player ...` rot
+  (No-Color-Fallback Bold/Reverse).
+- **Taste B = BLIND:** gleiche Armier-/Bestätigungskette wie A (`y` binnen
+  5 s), Banner `AI-ATTACK-BLIND ... UNTRACKED OK!`; feuert mit
+  `allow_untracked:true` und überspringt damit das Track-Gate des Probes.
+  `queue_ai_attack(eid, allow_untracked=False)` neuer Parameter.
+
+Probe-seitig keine Änderung nötig (`do_ai_attack` kennt `allow_untracked`
+bereits) — kein Remote-Deploy, kein Spiel-Neustart. Tests:
+`test_queue_ai_attack_untracked_payload`, Ingest-Success/Refusal-Tests,
+read_only-No-op für beide Keys.
+
+### 2026-08-23 — ai_tactical: Manueller ai-attack (Taste A + y-Bestätigung)
+
+**Neu**
+
+- `Collector.queue_ai_attack(eid)`: schreibt
+  `{"action":"ai-attack","id":N}` über den bewachten `send_commands`-Pfad
+  (cmdid-Floor, read_only-No-op, Pending-Tracking mit Stagnations-Watch).
+  IDs ≤0/None werden abgelehnt.
+- Tastenbindung `A`: armiert das selektierte Element (invertiertes Banner
+  mit Name/ID), `y` bestätigt binnen 5 s, jede andere Taste (oder Timeout)
+  bricht ab — ein Fehlgriff kann kein schweres C#-Work auf dem Spielhost
+  auslösen. Beantwortete Results geben den Pending-Slot frei; der
+  cp-Trace bleibt im `ship_probe_log.txt`.
+- Hilfe-Zeile um `A attack` ergänzt; 4 neue Tests (`TestAiAttackCommand`),
+  Suite 85 OK.
+
+Probe-seitig war alles vorhanden: `ai-attack` in `allow_commands`,
+`do_ai_attack` mit Ownership-Check, multi-host safe.
+
 ### 2026-08-23 — ai_tactical: PROBE BUSY-Banner bei Tick-Löchern
 
 **Befund (live gemessen):** Der `_random_tick_`-Hook des Spiels kommt in
