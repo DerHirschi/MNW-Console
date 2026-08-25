@@ -1,5 +1,64 @@
 # Changelog
 
+## v2.8 (2026-08-24) — Lock heartbeat, takeover, helo gate, TARGETING, DATALINK history
+
+Sync ship_probe + cli-gui from `masto/MNW-Tool/`. Fixes a critical multi-host bug
+where a dead full-probe owner (e.g. helicopter crash) blocked state writes forever.
+Adds command-only host takeover, helicopter lock gate, detected/timing diagnostics,
+and two new TUI features (TARGETING block, DATALINK history panel).
+
+### ship_probe.py
+
+- **`_LOCK_STALE_S` 30 min → 60 s** with heartbeat — the full probe now TOUCHES
+  the lock file mtime every acted tick (`_touch_heartbeat()`). A lock older than 60 s
+  while the game is running means the owner died; any command-only host may now take
+  over. Was 30 min with NO heartbeat: a dead owner (helo crash 2026-08-24) blocked
+  takeover for the whole window and state writes stayed dead ("gametick stale" forever).
+- **`_maybe_takeover()`** — rate-limited stale-lock takeover for command-only hosts.
+  Checks lock age periodically (`lock_takeover_check_s`, default 15 s + per-host jitter),
+  wins the `O_EXCL` race, builds a fresh full probe via `begin()`, demotes the old one.
+- **`_demote()`** — stops acting WITHOUT releasing the lock (a takeover winner may
+  already own it). Sets `_dead=True`, stops writer, closes log.
+- **Helicopter lock gate** — hosts whose caller file path contains "helicopter" are
+  forced command-only and never attempt `_acquire_lock()`. Two consecutive sessions
+  the lock landed on the Z-9C host: run 1 died (state writes dead), run 2 hung
+  natively ~60 s into hot contact.
+- **`tick()` early exit on `_dead`** — demoted probes return immediately.
+- **`_lock_path` stored on probe** — used by `_touch_heartbeat()` and `_demote()`.
+- **Detected freeze diagnostics** — per-element `_ai_track_probe()` timing logged
+  (`detected: elem N track probe M ms`), total elapsed logged at end.
+- **TARGETING surface in `do_ai_state`** — new blackboard-kv reads: `suspects_n`,
+  `suspects_ids`, `tracked_cat`, `contact_cache`, `target_lat/lon`, `target_course`,
+  `fire_domain`, `fire_orient`. Pure kv reads, no FireControl internals.
+- **`_LOCK_STALE_S` reduced to 60 s** (from 30 min) — enough for a command-only
+  host to detect a dead full probe within one check cycle.
+- **disasm references cleaned** (5 occurrences).
+
+### cli-gui/ai_tactical.py
+
+- **TARGETING block in DETAIL** — `parse_ai_state_detail` coerces new keys;
+  `render_detail` shows `TARGETING:` line (red when `suspects_n > 0`).
+- **DATALINK history panel** — event journal tracking order dispatches, assignment
+  changes, incoming orders, attack phase transitions. Capped at 60 entries.
+  `datalog_add()` / `render_datalink_history()` / curses panel.
+- **Ghost census** — counts elements that were seen but disappeared (no state update
+  for >30 s). `ghost_count()` / `render_ghost_summary()`.
+- **Ship + legacy plane ghosts** — ghost census now includes ship and legacy plane
+  elements that dropped out, not just helos/subs.
+- **`l` filter key** — toggles DATALINK history panel visibility.
+- **Tip renderer** — context-sensitive help tips at bottom of screen.
+- **`probe_died_ms` overlay** — amber banner when probe age exceeds threshold.
+
+### cli-gui/tests/test_ai_tactical.py
+
+- 17 new tests: TARGETING detail, DATALINK history, ghost census, ship ghosts,
+  tip renderer, `l` filter, probe_died_ms overlay, takeover config key.
+  Suite: 105 green.
+
+### Tests
+
+- ship_probe: 257 green. cli-gui: 105 green. Full suite: 362 green.
+
 ## v2.7 (2026-08-24) — Deadline scheduler + courier sections
 
 Sync ship_probe + cli-gui from `masto/MNW-Tool/`. Replaces the fixed-rotation

@@ -52,6 +52,7 @@ narrower terminals stack it above the table.
 """
 
 import argparse
+import collections
 import curses
 import io
 import json
@@ -390,6 +391,9 @@ def own_element_ids(ship_state):
     return ids
 
 
+_TYP_LABELS = {"SUB": "Submarine", "HEL": "Helicopter", "SHP": "Ship"}
+
+
 def normalize_elements(ai_state, ship_state, detected_map, asg_map,
                        ns_styles, presence, prev_ranges, now=None,
                        ext_map=None):
@@ -433,7 +437,7 @@ def normalize_elements(ai_state, ship_state, detected_map, asg_map,
     for eid, style in (ns_styles or {}).items():
         if eid in own_ids or eid == player_id or eid == 0 or eid in by_id:
             continue
-        if style in ("helo", "plane/sub"):
+        if style in ("helo", "plane/sub", "plane", "ship"):
             ids.append(eid)
             by_id[eid] = {"raw": {}, "src": "ns:%s" % style, "style": style}
     for eid, det in (detected_map or {}).items():
@@ -471,11 +475,11 @@ def normalize_elements(ai_state, ship_state, detected_map, asg_map,
             km = drm / 1000.0 if drm is not None else None
         style = info.get("style") or ns_styles.get(eid) or e.get("host_style")
         cat_raw = e.get("category") or ""
-        if "Submarine" in cat_raw or style == "plane/sub":
+        if "Submarine" in cat_raw or style in ("plane/sub", "plane"):
             typ = "SUB"
         elif "Aircraft" in cat_raw or style == "helo":
             typ = "HEL"
-        elif cat_raw:
+        elif cat_raw or style == "ship":
             typ = "SHP"
         else:
             typ = "?"
@@ -483,9 +487,10 @@ def normalize_elements(ai_state, ship_state, detected_map, asg_map,
         if not name:
             pres_p = info.get("presence") or {}
             pc = _short_enum(pres_p.get("category"), 20)
+            pc = "" if pc == "?" else pc
             pc = (pc.replace("ElementCategory.", "").replace("CategoryID.", "")
-                    or typ.title())
-            name = "%s #%d" % (pc or typ.title(), eid)
+                    or _TYP_LABELS.get(typ, typ))
+            name = "%s #%d" % (pc or _TYP_LABELS.get(typ, typ), eid)
         iord_id = _num(iord.get("assignment_id"))
         incoming = bool(iord) and iord_id is not None and iord_id >= 0
         det_ts_epoch = parse_ts(det.get("ts"))
@@ -534,6 +539,15 @@ def normalize_elements(ai_state, ship_state, detected_map, asg_map,
             "weapons": weapons_for(name),
             "asg_ts": ag.get("ts"),
             "det_ts": det.get("ts"),
+            "suspects_n": _num(e.get("suspects_n")),
+            "suspects_ids": e.get("suspects_ids"),
+            "tracked_cat": _num(e.get("tracked_cat")),
+            "contact_cache": e.get("contact_cache"),
+            "target_lat": _num(e.get("target_lat")),
+            "target_lon": _num(e.get("target_lon")),
+            "target_course": _num(e.get("target_course")),
+            "fire_domain": e.get("fire_domain"),
+            "fire_orient": e.get("fire_orient"),
         }
         els.append(el)
     els.sort(key=lambda x: (x["range_km"] is None, x["range_km"] if x["range_km"] is not None else 0, x["id"]))
@@ -561,6 +575,16 @@ def build_frame(data):
                              data.get("presence"),
                              data.get("prev_ranges") or {}, now=now,
                              ext_map=data.get("ext_map") or {})
+    # ghost census: every discovered ns-style element that is not the player
+    # and not an own-ship id (includes rows already merged into the table)
+    try:
+        pid = int(((ship.get("player") or {}).get("player_id")))
+    except (TypeError, ValueError):
+        pid = None
+    own_ids = own_element_ids(ship)
+    ghost_count = sum(1 for eid, st in (data.get("ns_styles") or {}).items()
+                      if eid and st and eid != 0 and eid not in own_ids
+                      and (pid is None or eid != pid))
     bb = ship.get("blackboard") or {}
     con = ship.get("contacts") or {}
     disabled = bool(con.get("disabled"))
@@ -670,6 +694,8 @@ def build_frame(data):
         "orders_pending": sorted((data.get("pending") or {}).keys()),
         "read_only": data.get("read_only", False),
         "ai_contacts": data.get("ai_contacts_map") or {},
+        "ghosts": ghost_count,
+        "dl_history": data.get("dl_history") or [],
     }
     return frame
 
@@ -809,6 +835,75 @@ def _sign(v):
     return 0
 
 
+def _dl_ts(epoch):
+    try:
+        return time.strftime("%H:%M:%S", time.localtime(float(epoch)))
+    except (TypeError, ValueError):
+        return "??:??:??"
+
+
+_DL_KIND_STYLES = {
+    "ORDER": "cyan", "ADOPTED": "cyan",
+    "DETECTED": "red", "DETCLEAR": "dim",
+    "ATTACK-OK": "green", "ATTACK-FAIL": "red",
+    "GHOST+": "amber", "GHOST-": "amber",
+}
+
+
+def dl_delta_events(prev, cur, now):
+    """ORDER/ADOPTED transitions between two {eid: raw-elem} snapshots.
+    Elements absent from prev are baseline -> no events (no startup flood)."""
+    out = []
+    for eid, e in cur.items():
+        p = prev.get(eid)
+        if not isinstance(p, dict):
+            continue
+        iord = e.get("incoming_order") or {}
+        iord_id = (_num(iord.get("assignment_id"))
+                   if isinstance(iord, dict) else None)
+        p_iord = p.get("incoming_order") or {}
+        p_iord_id = (_num(p_iord.get("assignment_id"))
+                     if isinstance(p_iord, dict) else None)
+        if iord_id is not None and iord_id >= 0 and iord_id != p_iord_id:
+            out.append({"ts_epoch": now, "eid": eid, "kind": "ORDER",
+                        "detail": "asg#%s" % int(iord_id)})
+        asg = _num(e.get("assignment_id"))
+        pasg = p.get("assignment_id")
+        if asg is not None and asg >= 0 and asg != pasg:
+            out.append({"ts_epoch": now, "eid": eid, "kind": "ADOPTED",
+                        "detail": "asg#%s" % int(asg)})
+    return out
+
+
+def detected_delta_events(prev, cur, now):
+    """Transition-only detected events (prev/cur: {eid: bool}) — repeated
+    identical states never journal (no flooding)."""
+    out = []
+    for eid, on in cur.items():
+        if eid in prev and prev[eid] != bool(on):
+            out.append({"ts_epoch": now, "eid": eid,
+                        "kind": "DETECTED" if on else "DETCLEAR",
+                        "detail": ""})
+    return out
+
+
+def render_datalink_lines(events, width, eid_filter=None, max_rows=12):
+    """DATALINK journal rows, newest at bottom; dim timestamp + kind-styled
+    remainder. Pure; safe on missing fields."""
+    evs = [e for e in (events or [])
+           if eid_filter is None or e.get("eid") == eid_filter]
+    out = []
+    for e in evs[-max(0, int(max_rows)):]:
+        kind = str(e.get("kind") or "?")
+        ts_txt = _dl_ts(e.get("ts_epoch"))
+        rest = ("  #%-3s %-11s %s" % (e.get("eid"), kind,
+                                      str(e.get("detail") or "")))
+        out.append([_seg(ts_txt[:width], "dim"),
+                    _seg(rest[:max(0, width - len(ts_txt))],
+                         _DL_KIND_STYLES.get(kind))])
+    return out
+
+
 def render_detail(frame, sel, width):
     els = frame["elements"]
     if not els:
@@ -854,6 +949,30 @@ def render_detail(frame, sel, width):
     if e.get("det_age") is not None:
         dline += " (%ss ago)" % e["det_age"]
     rows.append([_seg(dline, dsty)])
+    tgt = []
+    if e.get("suspects_n") is not None:
+        tgt.append("suspects=%s" % int(e["suspects_n"]))
+    if e.get("suspects_ids"):
+        sid = str(e["suspects_ids"])
+        tgt.append(sid if len(sid) <= 24 else sid[:21] + "…")
+    if e.get("tracked_cat") is not None:
+        tgt.append("tracked_cat=%s" % int(e["tracked_cat"]))
+    if e.get("contact_cache"):
+        tgt.append("cache=%s" % e["contact_cache"])
+    tgeo = ""
+    if e.get("target_lat") is not None and e.get("target_lon") is not None:
+        tgeo = " @%s" % _fmt_ll([e["target_lat"], e["target_lon"]])
+    if e.get("target_course") is not None:
+        tgeo += " crs=%s" % _brg(e["target_course"])
+    fire = ""
+    if e.get("fire_domain") or e.get("fire_orient"):
+        fire = " | FIRE %s -> %s" % (e.get("fire_domain") or "?",
+                                     e.get("fire_orient") or "?")
+    if tgt or tgeo or fire:
+        hot = (e.get("suspects_n") or 0) > 0
+        rows.append([_seg("TARGETING: ", "dim"),
+                     _seg((" ".join(tgt) + tgeo + fire).strip(),
+                          "red" if hot else None)])
     return rows
 
 
@@ -1180,6 +1299,11 @@ def render_frame_lines(frame, width, sel=0, detail=False):
     lines += render_threat_bar(frame, width)
     if detail:
         lines += render_detail(frame, sel, width)
+        dl = render_datalink_lines(frame.get("dl_history") or [], width,
+                                   max_rows=12)
+        if dl:
+            lines.append([_seg("DATALINK:", "dim")])
+            lines += dl
     return lines
 
 
@@ -1333,6 +1457,13 @@ class Collector(object):
         self._nsdump_attempts = 0
         # last manual ai-attack outcome (key A/B feedback banner)
         self.attack_status = None
+        # datalink journal (Stufe-1 event log per BRIEF_datalink_history.md)
+        self.dl_journal = collections.deque(maxlen=500)
+        self.dl_filter = None          # None = all events, else one element id
+        self._dl_prev_elems = {}       # eid -> raw elem (ORDER/ADOPTED base)
+        self._dl_prev_det = {}         # eid -> bool (DETECTED transitions)
+        self._dl_prev_ns = {}          # eid -> style (ghost appear/vanish)
+        self._pending_attack_eid = {}  # cmdid -> target eid (journal only)
 
     def send_commands(self, cmds):
         """Guarded write path: no-op list in read_only mode."""
@@ -1372,6 +1503,7 @@ class Collector(object):
         data["asg_map"] = self.asg_map
         data["ext_map"] = self.ext_map
         data["ai_contacts_map"] = self.contacts_map
+        data["dl_history"] = list(self.dl_journal)[-200:]
         if not self.paused:
             self.cycle += 1
             self._track_signatures(data)
@@ -1452,6 +1584,11 @@ class Collector(object):
                     "cmdid": cid, "ok": ok, "msg": msg[:120],
                     "ts_epoch": time.time(),
                 }
+                aeid = self._pending_attack_eid.pop(cid, None)
+                if aeid is not None:
+                    self._journal_event(aeid,
+                                        "ATTACK-OK" if ok else "ATTACK-FAIL",
+                                        msg)
         if newest_det is not None:
             age = None
             ts = parse_ts(newest_det.get("ts"))
@@ -1463,6 +1600,44 @@ class Collector(object):
             cur = self.detected_map.get(eid)
             if cur is None or det.get("detected") or not cur.get("detected"):
                 self.detected_map[eid] = dict(det, ts=self.detected_result.get("ts"))
+        self._journal_deltas(data)
+
+    def _journal_event(self, eid, kind, detail="", ts=None):
+        """Append one DATALINK journal entry (bounded ring buffer)."""
+        try:
+            ts_epoch = time.time() if ts is None else float(ts)
+        except (TypeError, ValueError):
+            ts_epoch = time.time()
+        self.dl_journal.append({"ts_epoch": ts_epoch, "eid": eid,
+                                "kind": kind, "detail": str(detail or "")[:80]})
+
+    def _journal_deltas(self, data):
+        """Journal ORDER/ADOPTED/DETECTED/ghost transitions for this poll.
+        Pure-diff: unchanged states never produce events."""
+        now = data.get("now", time.time())
+        cur = {}
+        for e in ((data.get("ai_state") or {}).get("elements") or []):
+            if e.get("id") is not None:
+                cur[e.get("id")] = e
+        for ev in dl_delta_events(self._dl_prev_elems, cur, now):
+            self.dl_journal.append(ev)
+        det_now = {eid: bool((d or {}).get("detected"))
+                   for eid, d in self.detected_map.items()}
+        for ev in detected_delta_events(self._dl_prev_det, det_now, now):
+            self.dl_journal.append(ev)
+        gone = sorted(eid for eid in self._dl_prev_ns
+                      if eid not in self.ns_styles)
+        new = sorted(eid for eid, st in self.ns_styles.items()
+                     if eid not in self._dl_prev_ns)
+        for eid in gone:
+            self._journal_event(eid, "GHOST-",
+                                self._dl_prev_ns.get(eid) or "", now)
+        for eid in new:
+            self._journal_event(eid, "GHOST+",
+                                self.ns_styles.get(eid) or "", now)
+        self._dl_prev_elems = cur
+        self._dl_prev_det = det_now
+        self._dl_prev_ns = dict(self.ns_styles)
 
     def _queue_commands(self, data):
         cmds = []
@@ -1484,16 +1659,22 @@ class Collector(object):
         has_refresh_inflight = any(v == "refresh" for v in self.pending.values())
         if stale and not has_refresh_inflight:
             cmds.append({"action": "planes"})
-        # ghost discovery: helo/sub rows come from ns-style log lines; after
-        # a mission restart the 400-line tail has none, so keep queueing one
-        # ns-dump until a ghost style actually shows up — first 3 tries at a
-        # short cadence, then a relaxed one to keep the orders queue clean
+        # ghost discovery: helo/sub/ship rows come from ns-style log lines;
+        # after a mission restart the 400-line tail has none, so keep queueing
+        # one ns-dump until a ghost style actually shows up - first 3 tries at
+        # a short cadence, then a relaxed one to keep the orders queue clean.
+        # Once ANY ghost is known, drop to a slow MAINTENANCE cadence: hosts
+        # whose single begin() dump rolled out of the log tail (legacy probes
+        # emit the sub's 'plane' style exactly once) are re-found this way.
         if not self._has_ghost_style():
             gap = 10 if self._nsdump_attempts < 3 else 30
             if self.cycle - self._last_nsdump_cycle >= gap:
                 cmds.append({"action": "ns-dump"})
                 self._last_nsdump_cycle = self.cycle
                 self._nsdump_attempts += 1
+        elif self.cycle - self._last_nsdump_cycle >= 24:
+            cmds.append({"action": "ns-dump"})
+            self._last_nsdump_cycle = self.cycle
         # detected scan: base cadence (>= 10 s) plus event trigger whenever
         # any element's signature changed (range/heading/assignment/...)
         due = self._detect_due or \
@@ -1532,7 +1713,8 @@ class Collector(object):
             self.pending_ts[i] = data["now"]
 
     def _has_ghost_style(self):
-        return any(s in ("helo", "plane/sub") for s in self.ns_styles.values())
+        return any(s in ("helo", "plane/sub", "plane", "ship")
+                   for s in self.ns_styles.values())
 
     def _next_asg_target(self, data):
         own = own_element_ids(data.get("ship_state") or {})
@@ -1643,6 +1825,7 @@ class Collector(object):
         if ids:
             self.pending[ids[0]] = "ai-attack"
             self.pending_ts[ids[0]] = time.time()
+            self._pending_attack_eid[ids[0]] = int(eid)
             return True
         return False
 
@@ -1808,7 +1991,7 @@ def _draw_box(scr, y0, width, height, title, colors=True, x0=0):
     return y0 + 1, x0 + 1, width - 2
 
 
-HELP_LINE = " q quit | \u2191\u2193 sel | TAB detail | d detect | e ai-state | a contacts | r refresh | p pause | +/- intv | c color | A attack | B blind "
+HELP_LINE = " q quit | \u2191\u2193 sel | TAB detail | d detect | e ai-state | a contacts | r refresh | p pause | +/- intv | c color | l dl-flt | A attack | B blind "
 
 PROBE_BUSY_S = 15.0
 
@@ -1905,6 +2088,21 @@ def run_curses(scr, collector, args):
             ty, tx, tw = _draw_box(scr, y, cw + 2, det_h,
                                    "DETAIL #%s" % el["id"], colors)
             _draw_rows(scr, det_rows, ty, tw, colors, x0=tx, max_h=det_h - 1)
+            # DATALINK journal below DETAIL (detail mode only, variant a of
+            # the brief: TAB toggles both; normal layout never shifts)
+            dl_rows = render_datalink_lines(fr.get("dl_history") or [], cw,
+                                            eid_filter=collector.dl_filter,
+                                            max_rows=12)
+            y2 = y + det_h
+            dl_h = min(len(dl_rows) + 2, max(0, footer_y - y2))
+            if dl_h >= 3:
+                dty, dtx, dtw = _draw_box(
+                    scr, y2, cw + 2, dl_h,
+                    "DATALINK%s" % (" #%s" % collector.dl_filter
+                                    if collector.dl_filter is not None else ""),
+                    colors)
+                _draw_rows(scr, dl_rows, dty, dtw, colors, x0=dtx,
+                           max_h=dl_h - 1)
         else:
             ty, tx, tw = _draw_box(scr, y, left_w if side_w else width, det_h,
                                    "THREATS", colors)
@@ -1913,10 +2111,11 @@ def run_curses(scr, collector, args):
         ages = fr.get("ages") or {}
         sa = ages.get("ship_state")
         aa = ages.get("ai_state")
-        footer = "%s| poll %.0fs | data s:%s ai:%s%s%s" % (
+        footer = "%s| poll %.0fs | data s:%s ai:%s | ghosts:%d%s%s" % (
             HELP_LINE, collector.interval,
             "%ss" % _fmt(sa, 0) if sa is not None else "?",
             "%ss" % _fmt(aa, 0) if aa is not None else "?",
+            fr.get("ghosts", 0),
             " | PAUSED" if collector.paused else "",
             " RO" if collector.read_only else "")
         try:
@@ -1996,6 +2195,12 @@ def run_curses(scr, collector, args):
             collector.force_refresh()
         elif ch == ord("c"):
             colors = not colors
+        elif ch == ord("l"):
+            # datalink filter cycle: all -> selected element -> all
+            if collector.dl_filter is None and nels:
+                collector.dl_filter = frame["elements"][sel]["id"]
+            else:
+                collector.dl_filter = None
         elif ch in (ord("A"), ord("B")):
             # manual ai-attack on the selected element - two-step confirm so
             # a stray keypress cannot fire heavy C# work on the game host.

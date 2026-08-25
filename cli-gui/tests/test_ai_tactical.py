@@ -230,6 +230,32 @@ class TestNormalizeMerge(unittest.TestCase):
         self.assertEqual(e21["src"], "presence")
         self.assertAlmostEqual(e21["lat"], 63.1)
 
+    def test_ship_ghost_rows(self):
+        """ns-style 'ship' entries become table rows (SHP) like helo/sub."""
+        els = at.normalize_elements(ai_state_fixture(), ship_state_fixture(),
+                                    {}, {}, {17: "ship"}, None, {})
+        e17 = [e for e in els if e["id"] == 17][0]
+        self.assertEqual(e17["type"], "SHP")
+        self.assertEqual(e17["src"], "ns:ship")
+        self.assertEqual(e17["style"], "ship")
+        self.assertEqual(e17["name"], "Ship #17")
+
+    def test_has_ghost_style_includes_ship(self):
+        col = at.Collector(at.LocalSource(tempfile.mkdtemp()), read_only=True)
+        self.assertFalse(col._has_ghost_style())
+        col.ns_styles.update({17: "ship"})
+        self.assertTrue(col._has_ghost_style())
+        col.ns_styles.update({14: "plane"})   # legacy probe: sub emits 'plane'
+        self.assertTrue(col._has_ghost_style())
+
+    def test_legacy_plane_ghost_is_sub_row(self):
+        """Older deployed probes emit 'ns /N/ style=plane' for submarines."""
+        els = at.normalize_elements(ai_state_fixture(), ship_state_fixture(),
+                                    {}, {}, {14: "plane"}, None, {})
+        e14 = [e for e in els if e["id"] == 14][0]
+        self.assertEqual(e14["type"], "SUB")
+        self.assertEqual(e14["src"], "ns:plane")
+
 
 class TestBuildFrame(unittest.TestCase):
     def _frame(self):
@@ -285,6 +311,21 @@ class TestBuildFrame(unittest.TestCase):
         f = at.build_frame(data)
         self.assertTrue(f["contacts"]["disabled"])
         self.assertEqual(f["contacts"]["count"], 0)
+
+    def test_ghost_counter(self):
+        data = {
+            "now": time.time(), "interval": 5.0,
+            "ship_state": ship_state_fixture(),
+            "ai_state": ai_state_fixture(),
+            "log_detected": {}, "detected_result": {}, "asg_map": {},
+            "ai_contacts_map": {},
+            # id 0 (contextless host module) never counts as a ghost
+            "ns_styles": {14: "plane/sub", 18: "helo", 17: "ship",
+                          0: "general"},
+            "presence": None, "prev_ranges": {},
+        }
+        f = at.build_frame(data)
+        self.assertEqual(f["ghosts"], 3)
 
 
 class TestRenderers(unittest.TestCase):
@@ -752,15 +793,21 @@ class TestRound2Fixes(unittest.TestCase):
                 col._queue_commands(data)            # no retry within 10 cycles
                 self.assertNotIn({"action": "ns-dump"}, seen)
                 col.cycle = 11
-                col.ns_styles[16] = "ship"           # styles exist, but no ghost
+                col.ns_styles[16] = "general"        # style exists, no ghost
                 col._queue_commands(data)
                 self.assertIn({"action": "ns-dump"}, seen)   # keep looking
                 seen[:] = []
                 col.pending.clear()
                 col.cycle = 21
-                col.ns_styles[18] = "helo"           # ghost found -> stop
-                col._queue_commands(data)
+                col.ns_styles[18] = "helo"           # ghost found -> discovery
+                col._queue_commands(data)            # stops (20 < 24: quiet)
                 self.assertNotIn({"action": "ns-dump"}, seen)
+                seen[:] = []
+                col.pending.clear()
+                del col.ns_styles[18]
+                col.cycle = 26
+                col._queue_commands(data)            # maintenance cadence
+                self.assertIn({"action": "ns-dump"}, seen)   # re-scan hosts
             finally:
                 at.send_commands = orig
         finally:
@@ -1074,6 +1121,192 @@ class TestProbeBusy(unittest.TestCase):
         # line must be the banner so the curses path shows it too
         rows = at.render_frame_lines(self._frame(30.0), 80)
         self.assertIn("PROBE BUSY", "".join(t for t, _ in rows[1]))
+
+
+class TestDatalinkJournal(unittest.TestCase):
+    """DATALINK panel: transition-only event journal (BRIEF_datalink_history)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="aitac_dl_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _elem(self, eid, asg=None, iord=None):
+        return {"id": eid,
+                "assignment_id": asg if asg is not None else -1,
+                "incoming_order": {"assignment_id": iord} if iord is not None
+                else {}}
+
+    def test_order_and_adopted_transitions(self):
+        prev = {17: self._elem(17)}
+        cur = {17: self._elem(17, asg=7, iord=9)}
+        evs = at.dl_delta_events(prev, cur, 1000.0)
+        kinds = [(e["kind"], e["detail"]) for e in evs]
+        self.assertIn(("ORDER", "asg#9"), kinds)
+        self.assertIn(("ADOPTED", "asg#7"), kinds)
+        for e in evs:
+            self.assertEqual(e["ts_epoch"], 1000.0)
+            self.assertEqual(e["eid"], 17)
+
+    def test_baseline_and_unchanged_produce_nothing(self):
+        base = {17: self._elem(17, asg=3, iord=2)}
+        self.assertEqual(at.dl_delta_events({}, base, 1.0), [])   # baseline
+        self.assertEqual(at.dl_delta_events(base, base, 1.0), []) # unchanged
+
+    def test_negative_or_missing_ids_ignored(self):
+        prev = {5: self._elem(5)}
+        cur = {5: self._elem(5, asg=-1, iord=-2)}
+        self.assertEqual(at.dl_delta_events(prev, cur, 1.0), [])
+
+    def test_detected_transitions_only(self):
+        evs = at.detected_delta_events({16: False}, {16: True}, 5.0)
+        self.assertEqual([e["kind"] for e in evs], ["DETECTED"])
+        evs = at.detected_delta_events({16: True}, {16: True}, 6.0)
+        self.assertEqual(evs, [])
+        evs = at.detected_delta_events({16: True}, {16: False}, 7.0)
+        self.assertEqual([e["kind"] for e in evs], ["DETCLEAR"])
+        # unknown element -> baseline, no event
+        self.assertEqual(at.detected_delta_events({}, {9: True}, 8.0), [])
+
+    def test_attack_event_on_ingest(self):
+        col = at.Collector(at.LocalSource(self.tmp), read_only=True)
+        col.pending[55] = "ai-attack"
+        col._pending_attack_eid[55] = 17
+        data = {"now": 123.0,
+                "results": {"results": [
+                    {"cmdid": 55, "action": "ai-attack", "ok": "true",
+                     "result": "PushOrder ok"}]},
+                "ai_state": {"elements": []}}
+        col._ingest_results(data, [])
+        hits = [e for e in col.dl_journal if e["kind"] == "ATTACK-OK"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["eid"], 17)
+        self.assertIn("PushOrder", hits[0]["detail"])
+        self.assertNotIn(55, col._pending_attack_eid)
+
+    def test_ghost_appear_vanish_events(self):
+        col = at.Collector(at.LocalSource(self.tmp), read_only=True)
+        data = {"now": 10.0, "ai_state": {"elements": []}}
+        col.ns_styles[18] = "helo"
+        col._journal_deltas(data)
+        self.assertEqual([e["kind"] for e in col.dl_journal], ["GHOST+"])
+        col.ns_styles.pop(18)
+        col._journal_deltas(data)
+        self.assertEqual([e["kind"] for e in col.dl_journal],
+                         ["GHOST+", "GHOST-"])
+        col._journal_deltas(data)          # unchanged -> nothing new
+        self.assertEqual(len(col.dl_journal), 2)
+
+    def test_renderer_styles_filter_and_width(self):
+        evs = [{"ts_epoch": 0, "eid": 17, "kind": "ORDER", "detail": "asg#9"},
+               {"ts_epoch": 60, "eid": 16, "kind": "DETECTED", "detail": ""},
+               {"ts_epoch": 120, "eid": 17, "kind": "ATTACK-FAIL",
+                "detail": "no lock"}]
+        rows = at.render_datalink_lines(evs, 90, eid_filter=17)
+        txts = ["".join(t for t, _ in r) for r in rows]
+        self.assertEqual(len(rows), 2)                       # filtered out #16
+        self.assertIn("ORDER", txts[0])
+        self.assertIn("ATTACK-FAIL", txts[1])                # newest last
+        self.assertEqual(rows[0][0][1], "dim")               # timestamp dim
+        self.assertEqual(rows[0][1][1], "cyan")              # ORDER cyan
+        self.assertEqual(rows[1][1][1], "red")
+        wide = at.render_datalink_lines(evs, 40)
+        for r in wide:
+            self.assertLessEqual(sum(len(t) for t, _ in r), 40)
+
+    def test_frame_roundtrip_and_textmode_detail(self):
+        hist = [{"ts_epoch": 30, "eid": 13, "kind": "GHOST+", "detail": "ship"}]
+        fr = at.build_frame({"ship_state": ship_state_fixture(),
+                             "dl_history": hist})
+        self.assertEqual(fr["dl_history"], hist)
+        lines = at.flatten(at.render_frame_lines(fr, 90, detail=True))
+        self.assertTrue(any("DATALINK:" in l for l in lines))
+        self.assertTrue(any("#13" in l and "GHOST+" in l for l in lines))
+        plain = at.flatten(at.render_frame_lines(fr, 90))
+        self.assertFalse(any("DATALINK:" in l for l in plain))
+
+
+class TestTargetingSurface(unittest.TestCase):
+    """TARGETING fields from the ai-state probe (suspects/tracked/fire)."""
+
+    def _detail_lines(self):
+        return ["ai-state: element id=17", "lat=63.51", "lon=5.99",
+                "suspects_n=2", "suspects_ids=1,7",
+                "tracked_cat=3", "contact_cache=5",
+                "target_lat=63.60", "target_lon=5.80",
+                "target_course=95.0",
+                "fire_domain=Surface(2)", "fire_orient=AttackRun(1)"]
+
+    def test_parse_targeting_keys(self):
+        v = at.parse_ai_state_detail(self._detail_lines())
+        self.assertEqual(v["target_id"], 17)
+        self.assertEqual(v["suspects_n"], 2)
+        self.assertEqual(v["suspects_ids"], "1,7")
+        self.assertEqual(v["tracked_cat"], 3)
+        self.assertEqual(v["contact_cache"], 5.0)
+        self.assertAlmostEqual(v["target_lat"], 63.60)
+        self.assertAlmostEqual(v["target_lon"], 5.80)
+        self.assertAlmostEqual(v["target_course"], 95.0)
+        self.assertEqual(v["fire_domain"], "Surface(2)")
+        self.assertEqual(v["fire_orient"], "AttackRun(1)")
+
+    def test_normalize_targeting_passthrough(self):
+        ext = {17: dict(at.parse_ai_state_detail(self._detail_lines()),
+                        ts_epoch=time.time())}
+        els = at.normalize_elements(ai_state_fixture(), ship_state_fixture(),
+                                    {}, {}, {17: "ship"}, None, {},
+                                    ext_map=ext)
+        e = [x for x in els if x["id"] == 17][0]
+        self.assertEqual(e["suspects_n"], 2)
+        self.assertEqual(e["suspects_ids"], "1,7")
+        self.assertEqual(e["tracked_cat"], 3)
+        self.assertEqual(e["contact_cache"], 5.0)
+        self.assertAlmostEqual(e["target_lat"], 63.60)
+        self.assertAlmostEqual(e["target_lon"], 5.80)
+        self.assertAlmostEqual(e["target_course"], 95.0)
+        self.assertEqual(e["fire_domain"], "Surface(2)")
+        self.assertEqual(e["fire_orient"], "AttackRun(1)")
+
+    def test_render_detail_targeting_row(self):
+        ext = {17: dict(at.parse_ai_state_detail(self._detail_lines()),
+                        ts_epoch=time.time())}
+        fr = at.build_frame({"ship_state": ship_state_fixture(),
+                             "ai_state": ai_state_fixture(),
+                             "ns_styles": {17: "ship"},
+                             "ext_map": ext})
+        els = [e for e in fr["elements"] if e["id"] == 17]
+        idx = fr["elements"].index(els[0])
+        txt = "\n".join(at.flatten(at.render_detail(fr, idx, 120)))
+        self.assertIn("TARGETING:", txt)
+        self.assertIn("suspects=2", txt)
+        self.assertIn("1,7", txt)
+        self.assertIn("tracked_cat=3", txt)
+        self.assertIn("cache=5.0", txt)
+        self.assertIn("FIRE Surface(2) -> AttackRun(1)", txt)
+        # hot element (has suspects) renders red
+        rows = at.render_detail(fr, idx, 120)
+        hot = [r for r in rows if any("suspects=" in t for t, _ in r)]
+        self.assertTrue(hot and any(st == "red" for _, st in hot[0]))
+
+    def test_render_detail_no_targeting_row_without_fields(self):
+        ext = {17: {"target_id": 17, "lat": 63.51, "lon": 5.99,
+                    "ts_epoch": time.time()}}
+        fr = at.build_frame({"ship_state": ship_state_fixture(),
+                             "ai_state": ai_state_fixture(),
+                             "ns_styles": {17: "ship"},
+                             "ext_map": ext})
+        idx = [i for i, e in enumerate(fr["elements"]) if e["id"] == 17][0]
+        txt = "\n".join(at.flatten(at.render_detail(fr, idx, 120)))
+        self.assertNotIn("TARGETING:", txt)
+
+    def test_stale_lock_takeover_config_key(self):
+        # probe-side contract: takeover check interval is configurable
+        src = open(os.path.join(os.path.dirname(__file__), os.pardir,
+                                os.pardir, "ship_probe.py"),
+                   encoding="utf-8").read()
+        self.assertIn("lock_takeover_check_s", src)
+        self.assertIn("_touch_heartbeat", src)
 
 
 if __name__ == "__main__":

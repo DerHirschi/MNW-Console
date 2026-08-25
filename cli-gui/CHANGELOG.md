@@ -5,6 +5,83 @@ Alle nennenswerten Änderungen dieses Teilprojekts. Format angelehnt an
 
 ## [Unreleased]
 
+### 2026-08-24 — ai_tactical: TARGETING-Block im DETAIL-Panel
+
+Ziel: sichtbar machen, welches Ziel ein KI-Element aktuell für seine Waffen
+erfasst hat (z. B. FFG-Raketenwerfer bei Ziel im Anstellwinkel). Reine
+Erweiterung des bestehenden `ai-state <id>`-Probes — KEINE
+WeaponController-/FireControl-Internals (dokumentierte Native-Crashes,
+siehe ship-probe/AGENTS.md `do_wc_dump`).
+
+**Neu**
+
+- Probe (`ship_probe.py`, `do_ai_state`): neue kv-Zeilen `suspects_n`,
+  `suspects_ids` (max. 8), `tracked_cat`, `contact_cache`,
+  `target_lat`/`target_lon`, `target_course`, `fire_domain`, `fire_orient`
+  — alle Blackboard-kv-Reads, `_try`-guarded.
+- TUI: `parse_ai_state_detail` coerced die neuen Keys automatisch
+  (generischer k=v-Parser); `normalize_elements` reicht sie als
+  Element-Felder durch; `render_detail` zeigt unter TRACK-ON-PLAYER eine
+  `TARGETING:`-Zeile (rot wenn `suspects_n > 0`, sonst normal; Zeile
+  entfällt komplett ohne Felder).
+
+### 2026-08-24 — ai_tactical: DATALINK-History-Panel (Brief Stufe 1)
+
+Umsetzung von `BRIEF_datalink_history.md` Stufe 1 (reine TUI, kein
+Probe-Change), Variante a: TAB öffnet DETAIL + darunter die `DATALINK`-Box —
+Normalmodus bleibt höhenstabil.
+
+**Neu**
+
+- **Event-Journal im Collector** (Ringpuffer, 500 Einträge): reine
+  Übergangs-Diffs pro Poll — `ORDER`/`ADOPTED` aus KI-State-Snapshots
+  (`incoming_order.assignment_id`, `assignment_id`), `DETECTED`/`DETCLEAR`
+  aus dem detected-Merge, `ATTACK-OK`/`ATTACK-FAIL` aus dem bestehenden
+  Result-Ingest (cmdid→eid via `_pending_attack_eid`),
+  `GHOST+`/`GHOST-` bei ns_styles-Änderung. Unveränderte Zustände erzeugen
+  keine Events; Baseline-Elemente (erster Poll) ebenfalls nicht.
+- **Renderer** `render_datalink_lines()` (pure): neueste Zeile unten,
+  max ~12 Rows, Styles ts=`dim` / ORDER·ADOPTED=`cyan` /
+  DETECTED=`red` / ATTACK=`green`·`red` / Ghost=`amber`; Narrow-safe.
+- **Taste `l`:** Filterzyklus alle → ausgewähltes Element → alle
+  (`DATALINK #id` im Box-Titel); HELP_LINE erweitert.
+- **Frame-Feld `dl_history`** (letzte 200 Events) → `--json` exportiert mit.
+
+**Bewusst nicht:** `--journal-file` (Auftraggeber-Entscheidung),
+Probe-seitiges `dl-log` (Stufe 2, braucht ship-probe-Abstimmung).
+
+**Tests**: 8 neue (`TestDatalinkJournal`) — Delta-Funktionen, Attack-
+Ingest, Ghost-Zyklus, Renderer (Styles/Filter/Breite), Frame-Roundtrip,
+Textmodus. Suite: 92 → 100 grün. Lokal end-to-end verifiziert
+(GHOST+-Events via `--json`).
+
+### 2026-08-24 — ai_tactical: Ship-Ghosts + Ghost-Zähler (AI Gauntlet Session)
+
+**Befund (live, ~20:30):** In der AI-Gauntlet-Mission zeigte die TUI nur
+Helo+Sub — die 4 feindlichen Schiffe fehlten. Ursachenkette: (1) der
+Full-Probe-Lock fiel diesmal auf den Helo-Host, `ai_state.json` enthielt
+nur dessen Namespaces (`/0/`, `/16/`); (2) die Ghost-Discovery aus den
+ns-dump-Zeilen des Logs filterte auf `helo`/`plane/sub` und verwarf
+`ship`; (3) der Sub-Host emittiert seinen Style nur EINMAL bei `begin()`
+— die Zeile rollt aus dem 400-Zeilen-Tail. Die Schiffe selbst waren
+voll funktionsfähig im Spiel (Spawns + Assignments 3–8 im Player.log).
+
+**Neu**
+
+- **Ship-Ghosts:** `normalize_elements` übernimmt ns_styles mit
+  `ship` als Tabellenzeilen (`typ=SHP`, Fallbackname „Ship #N");
+  Legacy-Style `plane` (ältere deployte Probe-Versionen klassifizieren
+  Subs so) wird ebenfalls akzeptiert → `SUB`.
+- **Ghost-Zähler:** Frame-Feld `ghosts` (Anzahl entdeckter ns_styles-
+  Elemente ohne Player/eigene IDs) im Footer: `| ghosts:N`.
+- **ns-dump-Wartungstakt:** Nach der Discovery-Phase (stoppt beim ersten
+  Ghost-Style) bleibt ein langsamer Rhythmus (~24 Zyklen) aktiv, damit
+  Hosts, deren einmalige begin()-Zeile aus dem Log-Tail gerollt ist,
+  wiederentdeckt werden.
+
+**Tests:** 92 bestanden (neu: ship-ghost rows, legacy-plane SUB,
+ghost counter, Wartungstakt im Bootstrap-Test).
+
 ### 2026-08-24 — ai_tactical: Attack-Feedback-Banner + Taste B (Blindangriff)
 
 **Befund (live, 07:08–07:12):** Die ersten fünf manuellen Attacks liefen

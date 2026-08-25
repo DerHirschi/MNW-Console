@@ -145,6 +145,23 @@ answer the discovery `ns-dump`, that is a probe-side issue — tracked as task 2
 `../ship-probe/BRIEF_orders_prune.md`
 (multi-host answer + deterministic element enumeration).
 
+### DATALINK history panel
+
+TAB opens the DETAIL box plus a `DATALINK` box underneath it — a transition-only
+event journal of the AI datalink, newest line at the bottom (max ~12 rows):
+
+- `ORDER` (cyan) — element received `_IncomingOrder` for a new assignment id
+- `ADOPTED` (cyan) — `_CurrentAssignment` changed
+- `DETECTED` / `DETCLEAR` (red / dim) — element gained or lost a track on you
+- `ATTACK-OK` / `ATTACK-FAIL` (green / red) — manual ai-attack outcome (A/B)
+- `GHOST+` / `GHOST-` (amber) — command-only host discovered or vanished
+
+Key `l` cycles the filter all → selected element → all (`DATALINK #id` in the box
+title). Built client-side from state diffs only (no extra probe commands, no C#
+calls); keeps 500 events in RAM and resets on TUI restart; `--json` exports the
+latest 200 as `frame.dl_history`. Probe-side message-level logging (`dl-log`)
+is future work — see `BRIEF_datalink_history.md`.
+
 ### Usage
 
 ```sh
@@ -154,8 +171,9 @@ python3 ai_tactical.py --log-dir <dir> --json --read-only              # one fra
 python3 ai_tactical.py --remote '...' --json --count 30                # NDJSON stream (1 frame/poll)
 ```
 
-Keys: `q` quit · `↑/↓` select · TAB detail · `d` detect now · `e` ai-state probe ·
-`a` ai-contacts now · `r` force refresh · `p` pause · `+/-` interval · `c` toggle color.
+Keys: `q` quit · `↑/↓` select · TAB detail + DATALINK · `d` detect now · `e` ai-state probe ·
+`a` ai-contacts now · `r` force refresh · `p` pause · `+/-` interval · `c` toggle color ·
+`l` datalink filter.
 `A` + `y` queues an ai-attack on the selected element (probe refuses when the
 element has no track on the player); `B` + `y` fires blind (`allow_untracked`,
 overrides the gate). The last attack's outcome shows as a banner for ~12 s.

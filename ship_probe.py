@@ -59,7 +59,12 @@ _SLICE_COURIER_MAX_MS = 4.0
 # the bursty double-update within ~11 s was pure waste (BRIEF Auftrag 3c).
 _AI_WRITE_MIN_S = 8.0
 _LOCK_NAME = "ship_probe.lock"
-_LOCK_STALE_S = 30 * 60
+# The full probe TOUCHES the lock mtime every acted tick (heartbeat). A lock
+# older than this while the game is running means the owner died/hung -> any
+# command-only host may take over. Was 30*60 with NO heartbeat: a dead owner
+# (helo crash 2026-08-24) blocked takeover for the whole window and state
+# writes stayed dead ('gametick stale' for ever).
+_LOCK_STALE_S = 60
 
 _DEFAULTS = {
     "log_dir": "",
@@ -1252,7 +1257,7 @@ class _Probe(object):
 
     def read_systems(self):
         out = {}
-        # Integrity (verified mnw.Mechanics.Integrity, all public
+        # Integrity (mnw.Mechanics.Integrity, all public
         # property reads; tank components carry IIntegrity.Status enum:
         # Operational=1, Malfunctioning=2, Damaged=4 — see damage command)
         st, comp = self._component("Integrity")
@@ -1752,9 +1757,9 @@ class _Probe(object):
         access_* ok on the PLAYER controller, and the live run confirmed
         Access[SonarSystem]() = ok. The player Virginia is sonar-equipped,
         so SonarSystem is guaranteed present -> Access[] is safe. The old
-        _Components field scan is dead (that field is private, invisible to
-        pythonnet getattr — same for the nested .Controller and
-        .Hub, which have no such fields exposed at all). Returns the
+        _Components field scan is dead (that field is invisible to pythonnet
+        getattr — same for the nested .Controller and .Hub, which have no
+        such fields exposed at all). Returns the
         SonarSystem instance or None."""
         ctrl = self.player_controller()
         if ctrl is None:
@@ -5961,6 +5966,7 @@ class _Probe(object):
         Returns a detail line per AI element that tracks the player plus a
         summary line 'DETECTED' or 'NOT detected by any AI element'."""
         lines = ["detected: scanning %s" % _desc(self._ai_namespaces(), 80)]
+        _t_det0 = time.monotonic()
         player_ll = None
         pnav = self.player_navigation()
         if pnav is not None:
@@ -6002,7 +6008,13 @@ class _Probe(object):
             if pid is not None and nid == pid:
                 continue
             kv = namespaces[ns]
+            _t_tp0 = time.monotonic()
             probe, tlines = self._ai_track_probe(nid, kv, player_ll, lines)
+            # Freeze diagnostics 2026-08-24: two sessions died during hot
+            # contact with the last log line inside this loop - per-element
+            # timing localizes the native call that never returns.
+            self.emit("detected: elem %d track probe %d ms" % (
+                nid, int((time.monotonic() - _t_tp0) * 1000)))
             lines.extend(tlines)
             if probe.get("found"):
                 found.append({"id": nid,
@@ -6014,8 +6026,12 @@ class _Probe(object):
                 lines.append("DETECTED by element %d (range %.0f m, contact id %s, %d contacts)" % (
                     f["id"], f["range_m"] or 0, _desc(f["contact_id"], 40), f["contacts"] or 0))
             lines.append("DETECTED elements: %s" % ", ".join(str(f["id"]) for f in found))
+            self.emit("detected: done in %d ms (%d trackers)" % (
+                int((time.monotonic() - _t_det0) * 1000), len(found)))
             return lines
         lines.append("NOT detected by any AI element")
+        self.emit("detected: done in %d ms (no trackers)" % int(
+            (time.monotonic() - _t_det0) * 1000))
         return lines
 
     def do_ai_contacts(self, cmd):
@@ -6330,6 +6346,66 @@ class _Probe(object):
             r = _try(lambda: cmgr.Count)
             if r[0] == "ok":
                 lines.append("contact_count=%d" % int(r[1]))
+        # targeting surface (2026-08-24): PURE blackboard-kv reads - no
+        # WeaponController/FireControl internals (native crash history, see
+        # do_wc_dump). Shows what attack_ops() would pass to
+        # WeaponController.Fire(range, orientation, domain) right now.
+        sus = kv.get("_EnemySuspiciousContacts")
+        if sus is not None:
+            r = _try(lambda: len(sus))
+            if r[0] == "ok":
+                lines.append("suspects_n=%d" % int(r[1]))
+                ids = []
+                try:
+                    short = list(sus)[:8]
+                except Exception:
+                    short = []
+                for cid in short:
+                    rr = _try(lambda cid=cid: _desc(cid, 24))
+                    if rr[0] == "ok":
+                        ids.append(str(rr[1]))
+                if ids:
+                    lines.append("suspects_ids=%s" % ",".join(ids))
+        tc = kv.get("_TrackedCategoryID")
+        if tc is not None:
+            r = _try(lambda: int(tc))
+            if r[0] == "ok":
+                lines.append("tracked_cat=%d" % r[1])
+        cc = kv.get("_ContactCache")
+        if cc is not None:
+            r = _try(lambda: int(cc.GetID))
+            if r[0] == "ok":
+                lines.append("contact_cache=%s" % r[1])
+            else:
+                rs = _try(lambda: _desc(cc, 30))
+                if rs[0] == "ok":
+                    lines.append("contact_cache=%s" % rs[1])
+        tg = kv.get("_TargetGeoCords")
+        if tg is not None:
+            rla = _try(lambda: float(tg.latitude))
+            rlo = _try(lambda: float(tg.longitude))
+            if rla[0] == "ok" and rlo[0] == "ok":
+                lines.append("target_lat=%.5f" % rla[1])
+                lines.append("target_lon=%.5f" % rlo[1])
+        tcrs = kv.get("_TargetCourse")
+        if tcrs is not None:
+            r = _try(lambda: float(tcrs))
+            if r[0] == "ok":
+                lines.append("target_course=%.1f" % r[1])
+
+        def _enum_short(v):
+            iv = _try(lambda v=v: int(v))
+            return "%s(%s)" % (_desc(v, 24), iv[1] if iv[0] == "ok" else "?")
+        asgo = kv.get("_CurrentAssignment")
+        if asgo is not None:
+            rd = _try(lambda: asgo.Domain)
+            if rd[0] == "ok" and rd[1] is not None:
+                lines.append("fire_domain=%s" % _enum_short(rd[1]))
+            rw = _try(lambda: asgo.Where)
+            if rw[0] == "ok" and rw[1] is not None:
+                ro = _try(lambda w=rw[1]: w.Orientation)
+                if ro[0] == "ok" and ro[1] is not None:
+                    lines.append("fire_orient=%s" % _enum_short(ro[1]))
         self.emit("ai-state done: %d fields" % (len(lines) - 1))
         return lines
 
@@ -6639,7 +6715,7 @@ class _Probe(object):
         if transit_cls is None:
             raise RuntimeError("Transit class unavailable")
         # Transit ctor takes (who, dest, TransitSpeed enum), not a float.
-        # Verified enum members:
+        # Verified enum members (mnw.scenarios.dll .TransitSpeed):
         #   Silent, Cruise, High   (NO "Low" — that was the pre-verify bug).
         ts_cls = self.g("TransitSpeed")
         if ts_cls is None:
@@ -6819,7 +6895,7 @@ class _Probe(object):
         # getters are unsafe to introspect from the Python bridge.
         # The Fire args we need (asg.Domain, asg.Where.Orientation) are
         # captured above. Weapon-side category data stays with the static
-        # analysis.
+        # Launcher weapon-side category data stays with the static definitions.
 
         # ---- 3b. launcher enumeration ------------------------------
         # INTENTIONALLY NOT dumped live: enumerating launchers means
@@ -6828,8 +6904,8 @@ class _Probe(object):
         # that froze the Unity main thread (2026-08-15, mnw 192% CPU, both
         # logs stopped on the same nanosecond). AGENTS.md Z.80 rule: no
         # un-gated live Component/Access[] reads. Launcher inventory stays
-        # a static-analysis concern.
-        lines.append("  launcher inventory: static analysis only (no live Access)")
+        # a static analysis concern from documented launcher data.
+        lines.append("  launcher inventory: static disassembly only (no live Access)")
         return lines
 
     # ---------------------------------------------------------------
@@ -6850,6 +6926,8 @@ class _Probe(object):
                 self.emit("dc deferred %s failed: %s" % (desc, r[1]))
 
     def tick(self):
+        if getattr(self, "_dead", False):
+            return
         self.tick_count += 1
         if self.tick_count % max(1, int(self.cfg.get("tick_delay", 30))) != 0:
             return
@@ -6870,11 +6948,19 @@ class _Probe(object):
         self._drain_dc_deferred()
         if getattr(self, "command_only", False):
             try:
+                self._maybe_takeover()
+            except Exception:
+                pass
+            try:
                 self.dispatch_orders()
             except Exception as e:
                 self.note_error("tick_command_only", e)
             self._record_block(_t_block0)
             return
+        try:
+            self._touch_heartbeat()
+        except Exception:
+            pass
         try:
             if self.active_mission() is None:
                 self.emit("no active mission - stopping")
@@ -7030,6 +7116,92 @@ class _Probe(object):
                         self.emit("clr_warmup Transit.TransitSpeed.%s=%s" % (m, "ok" if r2[0] == "ok" else str(r2[1])))
         except Exception as e:
             self.emit("clr_warmup Transit.TransitSpeed ERROR: %s: %s" % (type(e).__name__, e))
+
+    def _touch_heartbeat(self):
+        """Keep the election lock's mtime fresh while this probe owns it.
+        Command-only hosts take the lock over when its age exceeds
+        _LOCK_STALE_S - without a heartbeat the file stays frozen at the
+        acquisition instant and a dead owner blocked takeover for ever
+        (2026-08-24: helo host died -> no state writes until restart)."""
+        p = getattr(self, "_lock_path", None)
+        if p is None:
+            return
+        try:
+            if not os.path.exists(p):
+                # another host took over while we were idle/hung
+                self.emit("heartbeat: lock file gone - demoting this writer")
+                self._demote()
+                return
+            os.utime(p, None)
+        except Exception:
+            pass
+
+    def _demote(self):
+        """Stop acting WITHOUT releasing the lock - a takeover winner may
+        already own it (finish() would delete their lock file)."""
+        self._dead = True
+        try:
+            self.stop_writer()
+        except Exception:
+            pass
+        try:
+            self.emit("SHIP PROBE DEMOTED (lock lost)")
+        except Exception:
+            pass
+        try:
+            self.log.close()
+        except Exception:
+            pass
+
+    def _maybe_takeover(self):
+        """Rate-limited stale-lock takeover for command-only hosts.
+
+        When the full-probe owner died/hung (lock mtime older than
+        _LOCK_STALE_S while this host still ticks = game is running), the
+        NEXT stable element host promotes itself: acquire the lock, rebuild
+        a fresh full probe via begin(), demote the old object without
+        touching the new lock. Losers of the O_EXCL race just keep serving
+        commands."""
+        now_mono = time.monotonic()
+        if now_mono < getattr(self, "_takeover_next_mono", 0.0):
+            return
+        iv = max(5.0, float(self.cfg.get("lock_takeover_check_s", 15)))
+        # deterministic per-host jitter spreads the candidates a bit
+        self._takeover_next_mono = now_mono + iv + (id(self) % 7)
+        p = os.path.join(self.log_dir, _LOCK_NAME)
+        try:
+            age = time.time() - os.path.getmtime(p)
+        except Exception:
+            return  # no lock visible on this log_dir - nothing to take over
+        if age < _LOCK_STALE_S:
+            return
+        global _probe, _LOCK
+        newp = _acquire_lock()
+        if newp is None:
+            self.emit("takeover: lock stale %.0fs but lost the race" % age)
+            return
+        self.emit("takeover: lock stale %.0fs - promoting this host to full probe" % age)
+        old_probe = _probe
+        np = _Probe(_load_config())
+        try:
+            np._lock_path = newp
+        except Exception:
+            pass
+        _probe = np
+        _LOCK = newp
+        if old_probe is not None and old_probe is not np:
+            old_probe._demote()
+        try:
+            np.begin()
+            _debug_console("ship_probe: TAKEOVER promoted host=%s" % np.host_label())
+        except Exception:
+            _debug_console("ship_probe: TAKEOVER init FAILED")
+            try:
+                os.remove(newp)
+            except Exception:
+                pass
+            _probe = None
+            _LOCK = None
 
     def finish(self):
         self.emit("SHIP PROBE END (states=%d)" % self.state_count)
@@ -7198,7 +7370,17 @@ def ship_probe_tick(host=None):
     if ok is not True:
         _gate_reject_log(host, ok)
         return
-    lock_path = _acquire_lock()
+    # Fragile-host policy (2026-08-24): helicopter hosts must NEVER win the
+    # full-probe lock. Two consecutive sessions the lock landed on the Z-9C
+    # host: run 1 died with the helo's in-game crash (state writes dead ->
+    # endless 'gametick stale' in the TUI), run 2 hung natively ~60 s into
+    # hot contact. Helos stay command-only; ships/subs/player are the
+    # writer candidates.
+    if "helicopter" in _caller_file().lower():
+        _gate_reject_log(host, "helo-no-full-lock")
+        lock_path = None
+    else:
+        lock_path = _acquire_lock()
     try:
         _HOST = host
         _probe = _Probe(_load_config())
@@ -7206,6 +7388,10 @@ def ship_probe_tick(host=None):
             _probe.command_only = True
         else:
             _LOCK = lock_path
+            try:
+                _probe._lock_path = lock_path
+            except Exception:
+                pass
         _probe.begin()
         _debug_console("ship_probe: started, log_dir=%s, host=%s, lock=%s, mode=%s" % (
             _probe.log_dir,
