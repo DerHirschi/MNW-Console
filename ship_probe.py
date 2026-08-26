@@ -864,6 +864,14 @@ class _Probe(object):
         if len(self.errors) > 50:
             self.errors = self.errors[-50:]
         self.emit("ERROR(%s): %s" % (where, msg))
+        try:
+            tb = traceback.format_exception(type(e), e, e.__traceback__)
+            if tb:
+                tail = "".join(tb[-4:]).strip()
+                if tail:
+                    self.emit("TRACEBACK(%s): %s" % (where, tail))
+        except Exception:
+            pass
 
     def _atomic_write(self, fname, obj):
         path = os.path.join(self.log_dir, fname)
@@ -2959,7 +2967,7 @@ class _Probe(object):
     # element id in the CALLING host's interpreter namespace). Command-only
     # probes (one per element script that resolves the player) may run these;
     # all other actions are executed ONLY by the lock-holding full probe.
-    _ELEMENT_ACTIONS = ("ai-attack", "ns-dump", "asg", "ai-contacts", "ai-state")
+    _ELEMENT_ACTIONS = ("ai-attack", "ns-dump", "asg", "ai-contacts", "ai-state", "steer", "wc-dump")
 
     @staticmethod
     def _cmdid_of(c):
@@ -3002,14 +3010,44 @@ class _Probe(object):
                 break
             if command_only and str(cmd.get("action") or "") not in self._ELEMENT_ACTIONS:
                 continue
+            # Multi-host skip (2026-08-25): when the full probe holds the
+            # lock it reads ship_orders.json BEFORE command-only hosts do.
+            # Element-targeting commands (asg/ai-state/ai-attack) for elements
+            # on OTHER hosts get consumed + pruned before the correct host
+            # can pick them up -> "element not found" for everyone. Skip
+            # those commands here (advance cmdid so we don't retry, but do
+            # NOT add to processed_ids so the command stays in the file for
+            # the correct host's command-only probe).
+            act = str(cmd.get("action") or "")
+            if act in self._ELEMENT_ACTIONS:
+                _eid_r = _try(lambda: int(cmd.get("id")))
+                eid = _eid_r[1] if _eid_r[0] == "ok" else None
+                host_ns = set(int(x) for x in self._ai_namespaces())
+                if host_ns and eid is not None and eid not in host_ns:
+                    # DO NOT set self.last_cmdid here: skipped commands
+                    # must not advance the floor (stale-pruning would
+                    # drop them before the correct host can pick them up).
+                    # Add to grace so the full-probe's stale-pruning
+                    # leaves the order in the file for the right host.
+                    g = getattr(self, "_elem_grace", None)
+                    if g is None:
+                        g = self._elem_grace = {}
+                    if cmdid not in g:
+                        g[cmdid] = time.monotonic()
+                        self.emit("ns-skip: cmdid=%d %s eid=%s not in host_ns=%s"
+                                  % (cmdid, act, eid, sorted(host_ns)))
+                    continue
             processed += 1
             self.last_cmdid = cmdid
             processed_ids.add(cmdid)
-            if str(cmd.get("action") or "") in self._ELEMENT_ACTIONS:
-                # Multi-host delivery (BRIEF Auftrag 2): command-only hosts
-                # run in separate interpreters with their own tick phase - the
-                # full probe must leave the order in the file for a grace
-                # window or it wins the read/prune race and answers alone.
+            if (not command_only
+                    and str(cmd.get("action") or "") in self._ELEMENT_ACTIONS):
+                # Multi-host delivery (BRIEF Auftrag 2): the full probe
+                # processes the command but must leave the order in the
+                # file for command-only hosts to pick up. Grace protects
+                # the order from stale-pruning during the delivery window.
+                # Command-only hosts do NOT add grace — they own the
+                # element and prune immediately after processing.
                 g = getattr(self, "_elem_grace", None)
                 if g is None:
                     g = self._elem_grace = {}
@@ -3056,15 +3094,12 @@ class _Probe(object):
                 if cid is not None and cid <= last_floor:
                     has_stale = True
                     break
-        if not command_only and (processed_ids or has_stale):
-            # Only the lock-holding full probe owns the queue. Command-only
-            # instances (one per element script, separate interpreter each)
-            # must NOT re-run heavy commands like tanks/env across every tick
-            # and every (re-)initialization - repeated native C# calls crashed
-            # the game (mono native crash 2026-08-16). Drop the cmdids this
-            # instance ran AND every id at/below the floor (already processed
-            # or obsolete after an external writer restart - never executed
-            # retroactively). Re-read so concurrent appends survive.
+        can_prune = (processed_ids or has_stale)
+        # Command-only hosts: only prune their OWN processed_ids (element
+        # actions like asg/ai-state that the namespace skip allows through).
+        # Floor-based stale-pruning is still full-probe only — command-only
+        # hosts must NOT drop cmds they skipped (other host's element).
+        if can_prune and (not command_only or processed_ids):
             try:
                 with io.open(path, "r", encoding="utf-8") as f:
                     cur = json.load(f)
@@ -3081,7 +3116,7 @@ class _Probe(object):
                     # the floor
                     drop = set(processed_ids) - set(grace)
                     floor_drops = 0
-                    if last_floor is not None:
+                    if not command_only and last_floor is not None:
                         for c in cur_cmds:
                             cid = self._cmdid_of(c) if isinstance(c, dict) else None
                             if (cid is not None and cid <= last_floor
@@ -6905,7 +6940,7 @@ class _Probe(object):
         # logs stopped on the same nanosecond). AGENTS.md Z.80 rule: no
         # un-gated live Component/Access[] reads. Launcher inventory stays
         # a static analysis concern from documented launcher data.
-        lines.append("  launcher inventory: static disassembly only (no live Access)")
+        lines.append("  launcher inventory: static analysis only (no live Access)")
         return lines
 
     # ---------------------------------------------------------------

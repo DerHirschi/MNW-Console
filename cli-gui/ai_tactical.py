@@ -1464,6 +1464,8 @@ class Collector(object):
         self._dl_prev_det = {}         # eid -> bool (DETECTED transitions)
         self._dl_prev_ns = {}          # eid -> style (ghost appear/vanish)
         self._pending_attack_eid = {}  # cmdid -> target eid (journal only)
+        self._ingested_cmdids = set()  # rotation dedup: ext/asg maps only
+        # updated from re-ingestion of ship_results.json
 
     def send_commands(self, cmds):
         """Guarded write path: no-op list in read_only mode."""
@@ -1538,11 +1540,12 @@ class Collector(object):
                 vals = parse_asg_detail(r.get("detail") or [])
                 tid = vals.get("target_id")
                 if tid is not None:
-                    # result ts may be HH:MM:SS only -> parse_ts fails; the
-                    # ingest wall-clock is what rotation aging needs anyway
-                    ts_epoch = data["now"]
-                    cur = self.asg_map.get(tid)
-                    if cur is None or ts_epoch >= (cur.get("ts_epoch") or 0):
+                    # Only update asg_map for NEW results (first ingestion).
+                    # Re-ingestion of ship_results.json on every cycle would
+                    # refresh ts_epoch to data["now"], making all rotation
+                    # targets appear fresh — _next_asg_target never fires.
+                    if cid not in self._ingested_cmdids:
+                        ts_epoch = data["now"]
                         vals["ts_epoch"] = ts_epoch
                         self.asg_map[tid] = vals
                 if purpose == "asg":
@@ -1551,9 +1554,12 @@ class Collector(object):
                 vals = parse_ai_state_detail(r.get("detail") or [])
                 tid = vals.get("target_id")
                 if tid is not None:
-                    ts_epoch = data["now"]
-                    cur = self.ext_map.get(tid)
-                    if cur is None or ts_epoch >= (cur.get("ts_epoch") or 0):
+                    # Only update ext_map for NEW results (first ingestion).
+                    # Re-ingestion refreshes ts_epoch to data["now"] which
+                    # makes _next_ext_target always see age < ext_ttl → no
+                    # new ai-state commands ever sent for subs/helos.
+                    if cid not in self._ingested_cmdids:
+                        ts_epoch = data["now"]
                         vals["ts_epoch"] = ts_epoch
                         self.ext_map[tid] = vals
                 if purpose == "ext":
@@ -1589,6 +1595,8 @@ class Collector(object):
                     self._journal_event(aeid,
                                         "ATTACK-OK" if ok else "ATTACK-FAIL",
                                         msg)
+            if isinstance(cid, int) and (action == "asg" or action == "ai-state"):
+                self._ingested_cmdids.add(cid)
         if newest_det is not None:
             age = None
             ts = parse_ts(newest_det.get("ts"))
@@ -1596,6 +1604,10 @@ class Collector(object):
                 age = max(0.0, data["now"] - ts)
             self.detected_result = {"map": parse_detected_detail(newest_det.get("detail") or []),
                                     "ts": newest_det.get("ts"), "age_s": age}
+        # Cap the dedup set: keep last 1000 cmdids to prevent unbounded growth
+        if len(self._ingested_cmdids) > 1000 and self._result_cmdid_max > 0:
+            floor = self._result_cmdid_max - 500
+            self._ingested_cmdids = {c for c in self._ingested_cmdids if c > floor}
         for eid, det in self.detected_result.get("map", {}).items():
             cur = self.detected_map.get(eid)
             if cur is None or det.get("detected") or not cur.get("detected"):
@@ -2046,7 +2058,7 @@ def run_curses(scr, collector, args):
             _draw_rows(scr, own_rows, iy, iw, colors, x0=ix)
             y += len(own_rows) + 2
 
-        footer_y = h - 1
+        footer_y = h - 2  # 2 rows reserved: help line (h-1) + attack status (h-2)
         det_h = max(DETAIL_ROWS_BASE, (footer_y - y) // 2) if detail \
             else len(threat_rows) + 2
         avail = max(3, footer_y - det_h - y)
@@ -2090,12 +2102,13 @@ def run_curses(scr, collector, args):
             _draw_rows(scr, det_rows, ty, tw, colors, x0=tx, max_h=det_h - 1)
             # DATALINK journal below DETAIL (detail mode only, variant a of
             # the brief: TAB toggles both; normal layout never shifts)
-            dl_rows = render_datalink_lines(fr.get("dl_history") or [], cw,
-                                            eid_filter=collector.dl_filter,
-                                            max_rows=12)
+            dl_all = render_datalink_lines(fr.get("dl_history") or [], cw,
+                                           eid_filter=collector.dl_filter)
             y2 = y + det_h
-            dl_h = min(len(dl_rows) + 2, max(0, footer_y - y2))
+            dl_h = min(len(dl_all) + 2, max(0, footer_y - y2))
             if dl_h >= 3:
+                # auto-scroll: show newest entries that fit (bottom slice)
+                dl_rows = dl_all[-max(0, dl_h - 1):]
                 dty, dtx, dtw = _draw_box(
                     scr, y2, cw + 2, dl_h,
                     "DATALINK%s" % (" #%s" % collector.dl_filter

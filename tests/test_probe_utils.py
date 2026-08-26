@@ -256,7 +256,10 @@ class DispatchOrdersTest(unittest.TestCase):
             probe.dispatch_orders()
             res = self._read_results(tmp)
             self.assertEqual(sorted(int(r["cmdid"]) for r in res), [1, 3])
-            self.assertEqual([int(c["cmdid"]) for c in self._read_orders(tmp)], [0, 1, 2, 3])
+            # Command-only hosts now prune their own processed_ids (2026-08-25):
+            # skip cmds 0,2 (non-element actions), execute cmds 1,3, then
+            # prune the executed ones. Remaining: cmds 0,2.
+            self.assertEqual([int(c["cmdid"]) for c in self._read_orders(tmp)], [0, 2])
         finally:
             if probe is not None:
                 probe.finish()

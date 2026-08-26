@@ -1,5 +1,52 @@
 # Changelog
 
+## v2.9 (2026-08-25) — Multi-host skip, rotation dedup, watch 0.5s, traceback format
+
+Sync ship_probe + console + cli-gui from `masto/MNW-Tool/`. Fixes a multi-host
+race where the full probe consumed element-targeting commands before the correct
+command-only host could pick them up. Adds rotation dedup in the TUI, faster watch
+interval, and traceback formatting in the probe.
+
+### ship_probe.py
+
+- **Multi-host namespace skip** — when the full probe holds the lock it now skips
+  element-targeting commands (`ai-attack`, `ns-dump`, `asg`, `ai-contacts`, `ai-state`,
+  `steer`, `wc-dump`) whose target element ID is NOT in the full probe's own namespace.
+  Skipped commands stay in the file for the correct command-only host to pick up.
+  Prevents "element not found" for every host when the full probe consumes the order
+  first.
+- **`_ELEMENT_ACTIONS` expanded** — includes `steer` and `wc-dump` (new element-targeting
+  commands).
+- **Command-only pruning** — command-only hosts now prune their OWN processed_ids from
+  the order queue (previously only the full probe pruned). Floor-based stale pruning
+  remains full-probe only.
+- **Traceback formatting** — `note_error()` now includes the last 4 traceback frames
+  in the error line for easier debugging.
+- **disasm references cleaned** (6 occurrences).
+
+### console.py
+
+- **`_WATCH_INTERVAL = 0.5`** — watch default 3s → 0.5s (probe refreshes at ~2.9/s;
+  faster polling shows fresher data).
+- **Section age display** — `print_state()` shows per-section ages (`_sec_ts`) when
+  present: `sections (age): nav 2s | sys 5s | ...`.
+- **`ai-state` command** — REPL + one-shot now accept `ai-state ID` for per-element
+  detail queries.
+
+### cli-gui/ai_tactical.py
+
+- **Rotation dedup** — `_ingested_cmdids` set tracks which asg/ext results have been
+  ingested. Re-ingestion of `ship_results.json` on every cycle no longer refreshes
+  `ts_epoch` to `data["now"]`, which was preventing rotation targets from ever
+  appearing stale. Capped at 1000 entries.
+- **Footer 2-row reservation** — `footer_y = h - 2` reserves space for help line +
+  attack status line.
+- **DATALINK auto-scroll** — shows newest entries that fit (bottom slice of `dl_all`).
+
+### Tests
+
+- ship_probe: 257 green. cli-gui: 105 green.
+
 ## v2.8 (2026-08-24) — Lock heartbeat, takeover, helo gate, TARGETING, DATALINK history
 
 Sync ship_probe + cli-gui from `masto/MNW-Tool/`. Fixes a critical multi-host bug

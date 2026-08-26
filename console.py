@@ -69,6 +69,10 @@ STATE_FILE = "ship_state.json"
 PROBE_FILE = "ship_probe.json"
 ORDERS_FILE = "ship_orders.json"
 RESULTS_FILE = "ship_results.json"
+
+# Probe data refreshes at the acted-tick rate (~2.9/s, _random_tick_ hook);
+# polling faster than ~0.35s cannot show fresher data.
+_WATCH_INTERVAL = 0.5
 LOG_FILE = "ship_probe_log.txt"
 LOCK_FILE = "ship_probe.lock"
 
@@ -182,6 +186,17 @@ def print_state(d):
         print("state file error: %s" % d["__error__"])
         return 1
     print("== ship state (ts=%s) ==" % d.get("ts", "?"))
+    sec_ts = d.get("_sec_ts") or {}
+    if isinstance(sec_ts, dict) and sec_ts:
+        now = time.time()
+        ages = []
+        for name in sorted(sec_ts, key=lambda k: sec_ts.get(k) or 0):
+            try:
+                ages.append("%s %ds" % (name, int(now - float(sec_ts[name]))))
+            except Exception:
+                continue
+        if ages:
+            print("sections (age): %s" % " | ".join(ages))
     p = d.get("player") or {}
     print("player: id=%s is_player=%s source=%s" % (
         p.get("id", "?"), p.get("is_player"), p.get("source", "?")))
@@ -985,6 +1000,13 @@ def parse_action(words):
             return {"action": "asg", "id": int(args[0])}, None
         except ValueError:
             return None, "asg ID"
+    if action == "ai-state":
+        if not args:
+            return None, "ai-state ID"
+        try:
+            return {"action": "ai-state", "id": int(args[0])}, None
+        except ValueError:
+            return None, "ai-state ID"
     if action == "sonctl":
         if not args:
             return {"action": action, "sub": ""}, None
@@ -1150,7 +1172,7 @@ def parse_action(words):
 HELP = """\
 state                       show current player state
 probe                       show API discovery map (ship_probe.json)
-watch [interval_s] [count]  auto-refresh state (default 3s)
+watch [interval_s] [count]  auto-refresh state (default 0.5s)
 helm COURSE [EOT] [DEPTH]   set course (deg), EOT order, depth (m)
                             [--env N] depth band (0 periscope..3 max)
                             [--snap] [--bubble ANGLE] [--autotrim on|off]
@@ -1369,7 +1391,7 @@ def repl(log_dir):
             cmd_status(log_dir)
             continue
         if head == "watch":
-            interval = float(words[1]) if len(words) > 1 else 3.0
+            interval = float(words[1]) if len(words) > 1 else _WATCH_INTERVAL
             count = int(words[2]) if len(words) > 2 else None
             cmd_watch(log_dir, interval, count)
             continue
@@ -1394,7 +1416,7 @@ def repl(log_dir):
                 send_ai_attack(log_dir, cmd["id"], registry_only=True)
                 time.sleep(2.0)
             if cmd.get("watch"):
-                interval = float(words[1]) if len(words) > 1 else 3.0
+                interval = float(words[1]) if len(words) > 1 else _WATCH_INTERVAL
                 try:
                     while True:
                         cmd_ai(log_dir, cmd.get("id"))
@@ -1408,7 +1430,7 @@ def repl(log_dir):
         cmdid = next_cmdid(log_dir)
         n = send_commands(log_dir, [cmd])
         print("queued %d command(s) - waiting for probe cycle..." % n)
-        if cmd["action"] in ("detected", "ai-contacts", "ns-dump", "asg", "sonctl", "tracker", "tracker-new"):
+        if cmd["action"] in ("detected", "ai-contacts", "ns-dump", "asg", "ai-state", "sonctl", "tracker", "tracker-new"):
             time.sleep(1.5)
             cmd_result_for(log_dir, cmdid, wait=8.0)
         else:
@@ -1421,7 +1443,7 @@ def main():
     ap.add_argument("--game-root", help="MNW install dir (resolves Var/Scripts/Execute/_Source)")
     ap.add_argument("--log-dir", help="probe log dir (overrides --game-root)")
     ap.add_argument("--watch", action="store_true", help="continuous state watch")
-    ap.add_argument("--watch-interval", type=float, default=3.0)
+    ap.add_argument("--watch-interval", type=float, default=_WATCH_INTERVAL)
     ap.add_argument("--watch-count", type=int, default=None)
     args, rest = ap.parse_known_args()
     log_dir = resolve_log_dir(args)
