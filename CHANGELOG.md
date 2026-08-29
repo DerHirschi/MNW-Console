@@ -1,5 +1,41 @@
 # Changelog
 
+## v2.10 (2026-08-29) — Multi-host ai_state merge, blackboard helo gate, TUI ghost fix
+
+Sync ship_probe + cli-gui from `masto/MNW-Tool/`. Command-only hosts (helo, submarine)
+now contribute their element rows into `ai_state.json`, so ghosts in the TUI get real
+positions. Helicopter full-probe exclusion now uses a blackboard signature instead of
+the caller filename.
+
+### ship_probe.py
+
+- **Multi-host `ai_state.json` merge** — the full probe and every command-only element
+  host now write only their OWN element ids and keep the other hosts' entries. A plain
+  overwrite would clobber helo/sub entries and back. New async writer mode
+  `ai_state_merge` (`_enqueue_ai_merge` / `_writer_ai_state_merge`): background
+  read-merge-replace, queue-full drops superseded snapshots, writer thread serializes
+  so the read-merge-replace never races within a host.
+- **`_maybe_contribute_ai_state()`** — command-only hosts run a light per-own-element
+  pass (`_read_own_ai_elements`) mirroring the field set of `read_ai_elements`, filtered
+  to ids on THIS host (identified by their blackboard namespaces). Rate-limited by
+  `_AI_WRITE_MIN_S`. Contextless manager namespaces without `_Navigation` are skipped so
+  they don't pollute the file with positionless ghosts.
+- **`_host_is_helo()`** — helicopter full-probe exclusion now detects via blackboard
+  signing keys (`_DippingSonarController`, `_DippingSonarOps`, `_DippingEngaged`)
+  instead of `_caller_file().lower()`. MNW runs element scripts via exec making the
+  caller's `co_filename` literally `'<string>'`, so the filename check never matched.
+- **disasm references cleaned** (5 occurrences).
+
+### cli-gui/ai_tactical.py
+
+- **Ghost census excludes state rows** — elements now merged into `ai_state.json`
+  (contributed by their command-only hosts) render as real rows, not ghosts. The ghost
+  count filters out ids already present in `ai_state.json`.
+
+### Tests
+
+- ship_probe: 257 green. cli-gui: 105 green.
+
 ## v2.9 (2026-08-25) — Multi-host skip, rotation dedup, watch 0.5s, traceback format
 
 Sync ship_probe + console + cli-gui from `masto/MNW-Tool/`. Fixes a multi-host

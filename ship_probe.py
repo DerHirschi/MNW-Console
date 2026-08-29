@@ -390,6 +390,31 @@ def _host_can_target_player(host):
         return None
 
 
+# Dipping-sonar keys that only exist in a helicopter host's blackboard
+# (same markers read_ai_elements uses to flag is_helo).
+_HELO_BB_MARKERS = ("_DippingSonarController", "_DippingSonarOps",
+                    "_DippingEngaged")
+
+
+def _host_is_helo():
+    """True when THIS host's blackboard carries helicopter-only keys.
+
+    _caller_file() is useless for host classification: MNW runs element
+    scripts via exec, so the caller's co_filename is literally '<string>'
+    and 'helicopter' never matches. Detect by blackboard signature instead
+    (Z-9C etc. register _DippingSonar* under their own namespace)."""
+    try:
+        from pybt.bb.blackboard import Blackboard
+        store = Blackboard.storage
+        items = list(store.items())
+    except Exception:
+        return False
+    for k, _v in items:
+        if isinstance(k, str) and any(k.endswith(m) for m in _HELO_BB_MARKERS):
+            return True
+    return False
+
+
 def _cfg_path():
     try:
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), _CONFIG_FILE)
@@ -896,6 +921,13 @@ class _Probe(object):
     # background state writer: telemetry file I/O off the game thread
     # ---------------------------------------------------------------
 
+    # Merge marker for ai_state.json. The full probe and every command-only
+    # element host write THEIR OWN element ids and keep the other hosts' ids:
+    # a plain overwrite (as with ship_state.json) would let ship data clobber
+    # the helo/sub entries and back. The writer thread serializes all writes,
+    # so the read-merge-replace never races within a host.
+    _AI_MERGE = ("ai_state_merge",)
+
     def _writer_loop(self):
         while True:
             item = self._writeq.get()
@@ -904,6 +936,9 @@ class _Probe(object):
                     return
                 path, obj = item
                 try:
+                    if path == self._AI_MERGE[0]:
+                        self._writer_ai_state_merge(obj)
+                        continue
                     tmp = path + ".tmp"
                     with io.open(tmp, "w", encoding="utf-8") as f:
                         json.dump(obj, f, default=_json_default)
@@ -913,6 +948,39 @@ class _Probe(object):
                     del self._write_errors[:-20]
             finally:
                 self._writeq.task_done()
+
+    def _writer_ai_state_merge(self, own_elements):
+        """Background read-merge-replace of ai_state.json: replace the caller's
+        OWN element ids (indexed by 'id'), keep every foreign element, renew
+        ts/count. own_elements must be a private snapshot untouched afterwards
+        (the queue caller builds a fresh list every time)."""
+        path = os.path.join(self.log_dir, _AI_STATE_NAME)
+        existing = []
+        merged = own_elements
+        try:
+            with io.open(path, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+            old = prev.get("elements") if isinstance(prev, dict) else None
+            if isinstance(old, list):
+                existing = old
+                own_ids = set()
+                for e in own_elements:
+                    try:
+                        own_ids.add(e["id"])
+                    except Exception:
+                        pass
+                merged = [e for e in existing
+                          if not (isinstance(e, dict)
+                                  and e.get("id") in own_ids and e is not None)]
+                merged.extend(own_elements)
+        except Exception:
+            pass  # no prior file / unreadable -> write own elements only
+        out = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "count": len(merged), "elements": merged}
+        tmp = path + ".tmp"
+        with io.open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f, default=_json_default)
+        os.replace(tmp, path)
 
     def _ensure_writer(self):
         if getattr(self, "_writer_thread", None) is not None and self._writer_thread.is_alive():
@@ -939,6 +1007,22 @@ class _Probe(object):
                 pass
             try:
                 self._writeq.put_nowait((os.path.join(self.log_dir, fname), obj))
+            except queue.Full:
+                pass
+
+    def _enqueue_ai_merge(self, own_elements):
+        """Ask the writer thread to merge own_elements into ai_state.json.
+        Queue-full drops the request (a fresh snapshot is always on its way)."""
+        self._ensure_writer()
+        try:
+            self._writeq.put_nowait((self._AI_MERGE[0], own_elements))
+        except queue.Full:
+            try:
+                self._writeq.get_nowait()
+            except Exception:
+                pass
+            try:
+                self._writeq.put_nowait((self._AI_MERGE[0], own_elements))
             except queue.Full:
                 pass
 
@@ -2157,11 +2241,15 @@ class _Probe(object):
             self.emit("cp: ai elem %d ok" % nid)
         out["count"] = len(elements)
         out["elements"] = elements
-        self._write_state_async(_AI_STATE_NAME, out)
+        # Multi-host merge (2026-08-29): this host replaces ONLY its own
+        # element ids in ai_state.json and keeps the other hosts' entries
+        # (helo/sub on command-only hosts). A plain overwrite would clobber
+        # their ghost entries at every snapshot.
+        self._enqueue_ai_merge(elements)
         self._ai_last_write_mono = time.monotonic()
         self._ai_last_result = out
         self._ai_skip_emitted = False
-        self.emit("ai: %d elements -> %s" % (len(elements), _AI_STATE_NAME))
+        self.emit("ai: %d elements -> %s (merged)" % (len(elements), _AI_STATE_NAME))
         return out
 
     def read_mission(self):
@@ -6960,6 +7048,157 @@ class _Probe(object):
             if r[0] != "ok":
                 self.emit("dc deferred %s failed: %s" % (desc, r[1]))
 
+    def _maybe_contribute_ai_state(self):
+        """Command-only element hosts (helo, submarine) merge THEIR element
+        ids into ai_state.json so ghosts in the TUI get real positions.
+
+        Each host owns its blackboard namespaces (helo host ns=[0,16], sub
+        host ns=[14], ...) and sees only those elements. read_ai_elements()
+        is full-probe-only (it writes everything on its host); here we run a
+        light per-own-element pass with the same _try-guarded reads and let
+        the merge writer replace only our ids while keeping the other hosts'
+        entries. Rate-limited by _AI_WRITE_MIN_S like the full probe."""
+        now_mono = time.monotonic()
+        if now_mono < getattr(self, "_ai_contrib_next_mono", 0.0):
+            return
+        self._ai_contrib_next_mono = now_mono + _AI_WRITE_MIN_S
+        try:
+            bb = self._blackboard_storage()
+            if not bb:
+                return
+            own_ids = set()
+            for k in bb:
+                if isinstance(k, str):
+                    parts = k.split("/")
+                    if len(parts) >= 3 and parts[1].isdigit():
+                        own_ids.add(int(parts[1]))
+            if not own_ids:
+                return
+            # the player element is never a command-only host's own element,
+            # but skip id 0 (contextless host module, filtered in the TUI)
+            # and reuse read_ai_elements' heavy pass filtered to own ids.
+            fresh = self._read_own_ai_elements(own_ids)
+            if not fresh:
+                return
+            self._enqueue_ai_merge(fresh)
+            self.emit("ai: contribute %d element(s) -> %s (merged)"
+                      % (len(fresh), _AI_STATE_NAME))
+        except Exception as e:
+            self.note_error("ai_contribute", e)
+
+    def _read_own_ai_elements(self, own_ids):
+        """Lightweight per-own-namespace element snapshot (command-only host).
+
+        Mirrors the field set of read_ai_elements (identity/nav/assignment/
+        contacts/action-prep) so contributing rows render like full-state
+        rows, but only for ids on THIS host. Every engine read is _try-guarded
+        (same proven safe patterns as the full pass)."""
+        bb = self._blackboard_storage()
+        if not bb:
+            return []
+        try:
+            items = list(bb.items())
+        except Exception:
+            return []
+        namespaces = {}
+        for k, v in items:
+            if not isinstance(k, str):
+                continue
+            parts = k.split("/")
+            if len(parts) < 3 or not parts[1].isdigit():
+                continue
+            nid = int(parts[1])
+            if nid in own_ids:
+                namespaces.setdefault(nid, {})[parts[2]] = v
+        elems = []
+        det = self.detect_player()
+        try:
+            pid = int(det.get("player_id") or 0)
+        except Exception:
+            pid = None
+        for nid in sorted(namespaces):
+            kv = namespaces[nid]
+            if nid == 0 or (pid is not None and nid == pid):
+                continue
+            # Only real force elements with navigation contribute a row.
+            # Contextless manager namespaces (e.g. tactical_ai ns=[183,236])
+            # have no _Navigation -> their minimal dicts would just pollute
+            # ai_state.json with positionless ghosts.
+            if "_Navigation" not in kv:
+                continue
+            el = {"id": nid, "is_player": False}
+            if any(k in kv for k in ("_DippingSonarController", "_DippingSonarOps", "_DippingEngaged")):
+                el["is_helo"] = True
+            elif any(k in kv for k in ("_AttackOps", "_TrackedCategoryID")):
+                el["host_style"] = "ship"
+            if "_SelfInfo" in kv:
+                el["host_style"] = "general"
+            if kv.get("_Information") is not None:
+                el["identity_src"] = "_Information"
+            elif kv.get("_SelfInfo") is not None:
+                el["identity_src"] = "_SelfInfo"
+            info = kv.get("_Information") or kv.get("_SelfInfo")
+            if info is not None:
+                for name, fn in (
+                    ("name", lambda: str(info.ElementName)),
+                    ("country", lambda: int(info.CountryID)),
+                    ("category", lambda: str(info.Category)),
+                ):
+                    r = _try(fn)
+                    if r[0] == "ok":
+                        el[name] = r[1]
+            nav = kv.get("_Navigation")
+            if nav is not None:
+                r = _try(lambda: nav.INS.GeoCoordinates)
+                if r[0] == "ok":
+                    ll = _coord_to_ll(r[1])
+                    if ll is None:
+                        ll = self._merc_to_ll(r[1])
+                        if ll is not None:
+                            el["lat_lon_source"] = "mercator"
+                    if ll is not None:
+                        el["lat_lon"] = list(ll)
+                for name, attr in (
+                    ("heading", "Heading"), ("speed", "ForwardSpeed"),
+                    ("true_heading", "TrueHeading"), ("true_speed", "TrueForwardSpeed"),
+                    ("depth", "DepthGauge.Elevation"),
+                ):
+                    if attr == "DepthGauge.Elevation":
+                        r = _try(lambda: nav.DepthGauge.Elevation)
+                    else:
+                        r = _try(lambda attr=attr: getattr(nav.INS, attr))
+                    if r[0] == "ok":
+                        el[name] = _safe_num(r[1])
+            asg = kv.get("_CurrentAssignmentID")
+            if asg is not None:
+                r = _try(lambda: int(asg))
+                if r[0] == "ok":
+                    el["assignment_id"] = r[1]
+            for name, key in (("ordered_course", "_OrderedCourse"),
+                              ("ordered_eot", "_OrderedEOTOrder"),
+                              ("current_course", "_CurrentCourse"),
+                              ("current_eot", "_CurrentEOTOrder"),
+                              ("ordered_depth", "_OrderedDepth"),
+                              ("current_depth", "_CurrentDepth")):
+                v = kv.get(key)
+                if v is None:
+                    continue
+                r = _try(lambda v=v: int(v) if isinstance(v, (int, float)) else str(v))
+                if r[0] == "ok":
+                    el[name] = r[1]
+            cmgr = kv.get("_ContactManager")
+            if cmgr is not None:
+                r = _try(lambda: cmgr.Count)
+                if r[0] == "ok":
+                    el["contact_count"] = int(r[1])
+            prep = kv.get("_ActionPrepComplete")
+            if prep is not None:
+                r = _try(lambda: bool(prep))
+                if r[0] == "ok":
+                    el["action_prep_complete"] = r[1]
+            elems.append(el)
+        return elems
+
     def tick(self):
         if getattr(self, "_dead", False):
             return
@@ -6990,6 +7229,10 @@ class _Probe(object):
                 self.dispatch_orders()
             except Exception as e:
                 self.note_error("tick_command_only", e)
+            try:
+                self._maybe_contribute_ai_state()
+            except Exception as e:
+                self.note_error("tick_ai_contribute", e)
             self._record_block(_t_block0)
             return
         try:
@@ -7410,8 +7653,9 @@ def ship_probe_tick(host=None):
     # host: run 1 died with the helo's in-game crash (state writes dead ->
     # endless 'gametick stale' in the TUI), run 2 hung natively ~60 s into
     # hot contact. Helos stay command-only; ships/subs/player are the
-    # writer candidates.
-    if "helicopter" in _caller_file().lower():
+    # writer candidates. _caller_file() cannot identify the host (MNW exec
+    # reports '<string>'), so classify via blackboard signing keys.
+    if _host_is_helo():
         _gate_reject_log(host, "helo-no-full-lock")
         lock_path = None
     else:

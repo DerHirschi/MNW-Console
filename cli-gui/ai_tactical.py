@@ -575,15 +575,24 @@ def build_frame(data):
                              data.get("presence"),
                              data.get("prev_ranges") or {}, now=now,
                              ext_map=data.get("ext_map") or {})
-    # ghost census: every discovered ns-style element that is not the player
-    # and not an own-ship id (includes rows already merged into the table)
+    # ghost census: every discovered ns-style element that is not the player,
+    # not an own-ship id, and NOT already merged into ai_state.json (since
+    # 2026-08-29 command-only hosts contribute their ids -> they render as
+    # real rows, not ghosts)
     try:
         pid = int(((ship.get("player") or {}).get("player_id")))
     except (TypeError, ValueError):
         pid = None
     own_ids = own_element_ids(ship)
+    state_ids = set()
+    for e in ((ai or {}).get("elements") or []):
+        try:
+            state_ids.add(e["id"])
+        except Exception:
+            pass
     ghost_count = sum(1 for eid, st in (data.get("ns_styles") or {}).items()
                       if eid and st and eid != 0 and eid not in own_ids
+                      and eid not in state_ids
                       and (pid is None or eid != pid))
     bb = ship.get("blackboard") or {}
     con = ship.get("contacts") or {}
