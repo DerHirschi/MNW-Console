@@ -323,6 +323,17 @@ def parse_dl_reports_detail(lines):
     cur_op = None
     for ln in lines or []:
         s = ln.strip()
+        mm = re.match(r"^dl-reports: player at lat=([-0-9.]+) lon=([-0-9.]+)"
+                      r"(?: via (\S+))?", s)
+        if mm:
+            out["player"] = {"lat": _num(mm.group(1)),
+                             "lon": _num(mm.group(2)),
+                             "via": mm.group(3)}
+            continue
+        mm = re.match(r"^dl-reports: (all reports|player-centred reports)", s)
+        if mm:
+            out["mode"] = "all" if mm.group(1).startswith("all") else "player"
+            continue
         mm = re.match(r"^dl-reports: operators=([\d,]+)", s)
         if mm:
             out["operators_list"] = [int(x) for x in mm.group(1).split(",")
@@ -346,12 +357,26 @@ def parse_dl_reports_detail(lines):
                                   "aggregated_reports"):
             o["counts"][mm.group(1)] = int(mm.group(2))
             continue
+        mm = re.match(r"^([\w .]+)=dict\((\d+)\)$", s)
+        if mm and mm.group(1) in ("initial_reports", "theater fused",
+                                  "active_agents", "assignments",
+                                  "aggregated_reports"):
+            o["counts"][mm.group(1)] = int(mm.group(2))
+            continue
         mm = re.match(
             r"^last_reports entries=(\d+) shown=(\d+) \(mode=(\w+)\)$", s)
         if mm:
             o["entries"] = int(mm.group(1))
             o["shown"] = int(mm.group(2))
             o["mode"] = mm.group(3)
+            continue
+        mm = re.match(r"^last_reports entries=(\d+)", s)
+        if mm:
+            o["entries"] = int(mm.group(1))
+            continue
+        mm = re.match(r"^shown=(\d+)", s)
+        if mm:
+            o["shown"] = int(mm.group(1))
             continue
         mm = re.match(r"^report (.*)$", s)
         if mm:
@@ -1056,12 +1081,16 @@ def render_detail(frame, sel, width):
     # loop of each operator knows about the player right now
     dlr = frame.get("dl_reports") or {}
     ops = dlr.get("operators") or {}
+    plr = dlr.get("player") or {}
     if ops:
         for op in sorted(ops):
             o = ops[op]
             meta = o.get("meta") or {}
-            rows.append([_seg("REPORTS(op %s·%s): " % (op, o.get("mode") or "player"), "hdr"),
-                         _seg("real=%s val=%s cyc=%s ag=%s shown=%s/%s" % (
+            hdr = "REPORTS(op %s·%s): " % (op, o.get("mode") or dlr.get("mode") or "player")
+            if plr.get("lat") is not None and plr.get("lon") is not None:
+                hdr += " @%s" % _fmt_ll([plr.get("lat"), plr.get("lon")])
+            rows.append([_seg(hdr, "hdr"),
+                         _seg(" real=%s val=%s cyc=%s ag=%s shown=%s/%s" % (
                              meta.get("ai_realism", "?"), meta.get("validity", "?"),
                              meta.get("cycles", "?"), meta.get("count_agents", "?"),
                              o.get("shown", "?"), o.get("entries", "?")), "dim")])
@@ -1071,7 +1100,7 @@ def render_detail(frame, sel, width):
             for rep in reps[:8]:
                 km = ""
                 if rep.get("player_km") is not None:
-                    km = " @%skm" % _range_str(rep["player_km"])
+                    km = " @%s" % _range_str(rep["player_km"])
                     if rep.get("brg") is not None:
                         km += "@%s" % _brg(rep["brg"])
                 rows.append([_seg("  src=%s" % (rep.get("src", "?")), "dim"),
@@ -1906,10 +1935,12 @@ class Collector(object):
         return False
 
     def force_dl(self):
-        """Queue one dl-reports probe (player-centred operator reports)."""
+        """Queue one dl-reports probe (player-centred operator reports with
+        full deep reads of every report object)."""
         if self.read_only or any(v == "dl" for v in self.pending.values()):
             return False
-        ids = self.send_commands([{"action": "dl-reports"}])
+        ids = self.send_commands([{"action": "dl-reports", "deep": True,
+                                   "all_reps": True}])
         if ids:
             self.pending[ids[0]] = "dl"
             self.pending_ts[ids[0]] = time.time()

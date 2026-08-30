@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.12 (2026-08-30) — cli-gui: dl-reports full parse + reference player pos
+
+Sync cli-gui from `masto/MNW-Tool/`. Enhances the `dl-reports` TUI parse/render to
+consume the full report structure (player reference position, mode, operator counts)
+and queue deep reads.
+
+### cli-gui/ai_tactical.py
+
+- **`parse_dl_reports_detail`** — now parses the `dl-reports: player at lat=... lon=...
+  via ...` reference line into `out["player"]`, the `all reports|player-centred reports`
+  mode line into `out["mode"]`, operator count keys (`initial_reports`, `theater fused`,
+  `active_agents`, `assignments`, `aggregated_reports`) incl. the `=dict(N)` form,
+  `last_reports entries=N`, and `shown=N` lines.
+- **`render_detail`** — operator header shows the mode (`o.mode` falls back to the
+  dl_reports mode) and appends the reference player position `@lat,lon` via `_fmt_ll`
+  when present; `km` prefix space fixed (single space before range string).
+- **`force_dl()`** — queues `{"action":"dl-reports","deep":True,"all_reps":True}`
+  for full deep reads of every report object.
+
+### Tests
+
+- ship_probe: 257 green. cli-gui: 105 green. (both suites pass after sync)
+
 ## v2.11 (2026-08-30) — dl-reports command: WGS84 + player-centred km/brg
 
 Sync ship_probe + cli-gui from `masto/MNW-Tool/`. Adds a new `dl-reports` element
