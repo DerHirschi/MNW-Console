@@ -25,6 +25,7 @@ commands queued in ship_orders.json:
   {"action":"detected"}        per-element player-track scan (HIT/NO lines)
   {"action":"asg","id":N}      per-element ammo/threat/assignment/rpm values
   {"action":"ai-contacts"}     every element's own contact list
+  {"action":"dl-reports"}      tactical-AI operator report dump (player-centred)
 
 Results are matched by cmdid (single in-flight command per type keeps the
 last-writer-wins results file unambiguous).
@@ -290,6 +291,74 @@ def parse_ai_contacts_detail(lines):
                 tok = kv.strip()
                 c["id"] = re.sub(r"^id[\s=:]*", "", tok).strip("'\" ") or tok
         out[cur].append(c)
+    return out
+
+
+_REPORT_META_KEYS = ("country_id", "ai_realism", "validity", "cycles",
+                     "count_agents", "count_all_agents")
+
+
+def _parse_report_row(s):
+    """One '  src=5 op=183 ... player=14.2km@312deg ... (partial)' report line."""
+    rep = {}
+    for k, v in re.findall(r"(\w+)=([^\s]+)", s):
+        if k == "player":
+            m = re.match(r"([\d.]+)km@(-?[\d.]+)deg", v)
+            if m:
+                rep["player_km"] = _num(m.group(1))
+                rep["brg"] = _num(m.group(2))
+            continue
+        n = _num(v)
+        rep[k] = n if n is not None else v
+    if "partial" in s:
+        rep["partial"] = True
+    return rep
+
+
+def parse_dl_reports_detail(lines):
+    """Parse an 'dl-reports' result detail into
+    {"operators_list": [...], "operators": {op: {"meta": {...}, "counts": {...},
+     "reports": [...], "entries": N, "shown": N, "mode": "player"|"all"}}}."""
+    out = {"operators": {}}
+    cur_op = None
+    for ln in lines or []:
+        s = ln.strip()
+        mm = re.match(r"^dl-reports: operators=([\d,]+)", s)
+        if mm:
+            out["operators_list"] = [int(x) for x in mm.group(1).split(",")
+                                     if x.strip().isdigit()]
+            continue
+        mm = re.match(r"^== operator (\d+) ==", s)
+        if mm:
+            cur_op = int(mm.group(1))
+            out["operators"][cur_op] = {"meta": {}, "counts": {}, "reports": []}
+            continue
+        if cur_op is None:
+            continue
+        o = out["operators"][cur_op]
+        mm = re.match(r"^(%s)=(-?[\d.]+)$" % "|".join(_REPORT_META_KEYS), s)
+        if mm:
+            o["meta"][mm.group(1)] = _num(mm.group(2))
+            continue
+        mm = re.match(r"^([\w .]+)=(\d+)$", s)
+        if mm and mm.group(1) in ("initial_reports", "theater fused",
+                                  "active_agents", "assignments",
+                                  "aggregated_reports"):
+            o["counts"][mm.group(1)] = int(mm.group(2))
+            continue
+        mm = re.match(
+            r"^last_reports entries=(\d+) shown=(\d+) \(mode=(\w+)\)$", s)
+        if mm:
+            o["entries"] = int(mm.group(1))
+            o["shown"] = int(mm.group(2))
+            o["mode"] = mm.group(3)
+            continue
+        mm = re.match(r"^report (.*)$", s)
+        if mm:
+            o["reports"].append(_parse_report_row(mm.group(1)))
+            continue
+        if s.startswith("src="):
+            o["reports"].append(_parse_report_row(s))
     return out
 
 
@@ -705,6 +774,7 @@ def build_frame(data):
         "ai_contacts": data.get("ai_contacts_map") or {},
         "ghosts": ghost_count,
         "dl_history": data.get("dl_history") or [],
+        "dl_reports": data.get("dl_reports_map") or {},
     }
     return frame
 
@@ -982,6 +1052,34 @@ def render_detail(frame, sel, width):
         rows.append([_seg("TARGETING: ", "dim"),
                      _seg((" ".join(tgt) + tgeo + fire).strip(),
                           "red" if hot else None)])
+    # tactical-AI operator report dump (dl-reports, key g): what the OODA
+    # loop of each operator knows about the player right now
+    dlr = frame.get("dl_reports") or {}
+    ops = dlr.get("operators") or {}
+    if ops:
+        for op in sorted(ops):
+            o = ops[op]
+            meta = o.get("meta") or {}
+            rows.append([_seg("REPORTS(op %s·%s): " % (op, o.get("mode") or "player"), "hdr"),
+                         _seg("real=%s val=%s cyc=%s ag=%s shown=%s/%s" % (
+                             meta.get("ai_realism", "?"), meta.get("validity", "?"),
+                             meta.get("cycles", "?"), meta.get("count_agents", "?"),
+                             o.get("shown", "?"), o.get("entries", "?")), "dim")])
+            reps = (o.get("reports") or [])
+            if not reps:
+                rows.append([_seg("  no player-centred reports", "dim")])
+            for rep in reps[:8]:
+                km = ""
+                if rep.get("player_km") is not None:
+                    km = " @%skm" % _range_str(rep["player_km"])
+                    if rep.get("brg") is not None:
+                        km += "@%s" % _brg(rep["brg"])
+                rows.append([_seg("  src=%s" % (rep.get("src", "?")), "dim"),
+                             _seg(" %s%s crs=%s spd=%skt%s" % (
+                                 _fmt_ll([rep.get("lat"), rep.get("lon")]),
+                                 km, _fmt(rep.get("course"), 0),
+                                 _fmt(rep.get("speed"), 1),
+                                 " part" if rep.get("partial") else ""))])
     return rows
 
 
@@ -1454,6 +1552,7 @@ class Collector(object):
         self.asg_map = {}
         self.contacts_map = {}
         self.ext_map = {}
+        self.dl_reports_map = {}
         self.ns_styles = {}
         self.refresh_queued = False
         self.paused = False
@@ -1515,6 +1614,7 @@ class Collector(object):
         data["ext_map"] = self.ext_map
         data["ai_contacts_map"] = self.contacts_map
         data["dl_history"] = list(self.dl_journal)[-200:]
+        data["dl_reports_map"] = self.dl_reports_map
         if not self.paused:
             self.cycle += 1
             self._track_signatures(data)
@@ -1575,6 +1675,9 @@ class Collector(object):
                     self._pop_pending(cid)
             elif purpose == "contacts":
                 self.contacts_map = parse_ai_contacts_detail(r.get("detail") or [])
+                self._pop_pending(cid)
+            elif purpose == "dl":
+                self.dl_reports_map = parse_dl_reports_detail(r.get("detail") or [])
                 self._pop_pending(cid)
             elif purpose == "refresh":
                 self._pop_pending(cid)
@@ -1802,6 +1905,17 @@ class Collector(object):
             return True
         return False
 
+    def force_dl(self):
+        """Queue one dl-reports probe (player-centred operator reports)."""
+        if self.read_only or any(v == "dl" for v in self.pending.values()):
+            return False
+        ids = self.send_commands([{"action": "dl-reports"}])
+        if ids:
+            self.pending[ids[0]] = "dl"
+            self.pending_ts[ids[0]] = time.time()
+            return True
+        return False
+
     def force_refresh(self):
         if self.read_only or any(v == "refresh" for v in self.pending.values()):
             return False
@@ -2012,7 +2126,7 @@ def _draw_box(scr, y0, width, height, title, colors=True, x0=0):
     return y0 + 1, x0 + 1, width - 2
 
 
-HELP_LINE = " q quit | \u2191\u2193 sel | TAB detail | d detect | e ai-state | a contacts | r refresh | p pause | +/- intv | c color | l dl-flt | A attack | B blind "
+HELP_LINE = " q quit | \u2191\u2193 sel | TAB detail | d detect | e ai-state | a contacts | g dl-rep | r refresh | p pause | +/- intv | c color | l dl-flt | A attack | B blind "
 
 PROBE_BUSY_S = 15.0
 
@@ -2213,6 +2327,8 @@ def run_curses(scr, collector, args):
             collector.force_ext()
         elif ch == ord("a"):
             collector.force_contacts()
+        elif ch == ord("g"):
+            collector.force_dl()
         elif ch == ord("r"):
             collector.force_refresh()
         elif ch == ord("c"):

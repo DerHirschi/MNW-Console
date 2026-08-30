@@ -81,7 +81,7 @@ _DEFAULTS = {
     # command-only hosts (separate interpreters, own tick phase) can see and
     # answer them too. 0 = old behavior (full probe eats them immediately).
     "element_action_grace_s": 5.0,
-    "allow_commands": ["helm", "planes", "sd-dump", "tanks", "env", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc", "ai-state"],
+    "allow_commands": ["helm", "planes", "sd-dump", "tanks", "env", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc", "ai-state", "dl-reports"],
     "resolve_positions": False,
     "state_every": 3,
     "collect_mode": "queue",
@@ -1352,7 +1352,7 @@ class _Probe(object):
         # Integrity (mnw.Mechanics.Integrity, all public
         # property reads; tank components carry IIntegrity.Status enum:
         # Operational=1, Malfunctioning=2, Damaged=4 — see damage command)
-        st, comp = self._component("Integrity")
+        _, st, comp = self._component_any("Integrity", prefer="player")
         if st == "ok" and comp is not None:
             for name, fn in (
                 ("integrity_damage_ratio", lambda: comp.DamageLevelRatio),
@@ -1423,7 +1423,7 @@ class _Probe(object):
                     if damaged:
                         out["%s_damaged" % pref] = damaged[:8]
         # Ammunition
-        st, comp = self._component("AmmunitionStorage")
+        st, comp = self._component_any("AmmunitionStorage", prefer="player")[1:]
         if st == "ok":
             for name, fn in (
                 ("ammo_offensive_ratio", lambda: comp.OffensiveCombatPowerRatio),
@@ -1433,7 +1433,7 @@ class _Probe(object):
                 if r[0] == "ok":
                     out[name] = _safe_num(r[1], 4)
         # Maneuvering
-        st, comp = self._component("Maneuvering")
+        st, comp = self._component_any("Maneuvering", prefer="player")[1:]
         if st == "ok":
             r = _try(lambda: comp.CMP.RPM)
             if r[0] == "ok":
@@ -1519,7 +1519,7 @@ class _Probe(object):
                 if r[0] == "ok":
                     out[name] = r[1]
         # Coxswain (bulkheads / lights / CIWs)
-        st, comp = self._component("Coxswain")
+        st, comp = self._component_any("Coxswain", prefer="player")[1:]
         if st == "ok":
             r = _try(lambda: comp.Bulkheads)
             if r[0] == "ok":
@@ -1534,7 +1534,7 @@ class _Probe(object):
             if r[0] == "ok":
                 out["ciws"] = _desc(r[1], 80)
         # FireControl / ContactManager
-        st, comp = self._component("FireControl")
+        st, comp = self._component_any("FireControl", prefer="player")[1:]
         if st == "ok":
             cm = _try(lambda: comp.ContactManager)
             if cm[0] == "ok":
@@ -2310,8 +2310,9 @@ class _Probe(object):
         self._merc_conv = calls
         return calls
 
-    def _merc_to_ll(self, merc):
-        if merc is None or not self.cfg.get("resolve_positions", True):
+    def _merc_to_ll(self, merc, force=False):
+        if merc is None or (not force
+                            and not self.cfg.get("resolve_positions", True)):
             return None
         calls = self._merc_calls() or []
         if not calls:
@@ -3049,13 +3050,13 @@ class _Probe(object):
     # command dispatch (CONTROL side)
     # ---------------------------------------------------------------
 
-    _ACTIONS = ("helm", "planes", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "sd-dump", "tanks", "env", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc", "ai-state")
+    _ACTIONS = ("helm", "planes", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "sd-dump", "tanks", "env", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc", "ai-state", "dl-reports")
 
     # Commands whose native access is ELEMENT-scoped (target a specific
     # element id in the CALLING host's interpreter namespace). Command-only
     # probes (one per element script that resolves the player) may run these;
     # all other actions are executed ONLY by the lock-holding full probe.
-    _ELEMENT_ACTIONS = ("ai-attack", "ns-dump", "asg", "ai-contacts", "ai-state", "steer", "wc-dump")
+    _ELEMENT_ACTIONS = ("ai-attack", "ns-dump", "asg", "ai-contacts", "ai-state", "steer", "wc-dump", "dl-reports")
 
     @staticmethod
     def _cmdid_of(c):
@@ -6531,6 +6532,381 @@ class _Probe(object):
                     lines.append("fire_orient=%s" % _enum_short(ro[1]))
         self.emit("ai-state done: %d fields" % (len(lines) - 1))
         return lines
+
+    # ---------------------------------------------------------------
+    # dl-reports: dump the tactical-AI operator blackboard reports.
+    # The engine feeds fire orders purely from opfor_report.Telemetry
+    # (build_picture.py: AiDataLink.PullReport -> merge into last_reports/
+    # theater -> PushReport; give_orders.py: Engage from Coordinates), so
+    # this shows exactly what the OODA loop of an operator knows right now.
+    #
+    # player mode (default): only reports whose target lies within
+    # 'dl_player_km' (default 20) of the player position - the reports
+    # that matter to the player. all=true lists every report the operator
+    # holds, regardless of target. op=<int> restricts to one operator;
+    # without it every operator namespace that carries last_reports is
+    # scanned. Only field reads (_try-guarded) + coordinate resolution;
+    # runs on any host with the /<op>/ namespace (e.g. tactical_ai).
+    # ---------------------------------------------------------------
+
+    def _report_source_id(self, report):
+        for attr in ("Source", "SourceID", "ID"):
+            self.emit("dl-r src .%s get" % attr)
+            r = _try(lambda attr=attr: getattr(report, attr))
+            self.emit("dl-r src .%s -> %s" % (attr, r[0]))
+            if r[0] == "ok":
+                v = r[1]
+                if isinstance(v, (int, float)):
+                    try:
+                        return int(v)
+                    except Exception:
+                        pass
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+        return None
+
+    def _report_operator_id(self, report):
+        # Operator.CountryID on these blackboard operator objects is a KNOWN
+        # native freeze (verified 2026-08-14; _host_operator_id only ever uses
+        # host _Information.CountryID for the same reason). Only the direct
+        # report-level OperatorID property is safe.
+        self.emit("dl-r opid .OperatorID get")
+        iv = _try(lambda: getattr(report, "OperatorID"))
+        self.emit("dl-r opid .OperatorID -> %s" % iv[0])
+        if iv[0] == "ok" and isinstance(iv[1], (int, float)):
+            try:
+                return int(iv[1])
+            except Exception:
+                pass
+        if iv[0] == "ok":
+            v = iv[1]
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if v is not None and not isinstance(v, (int, float, str, bool, list, tuple, dict)):
+                self.emit("dl-r opid .OperatorID opaque %s" % type(v).__name__)
+        self.emit("dl-r opid .Operator get (surface only, no sub-attrs)")
+        r = _try(lambda: getattr(report, "Operator"))
+        self.emit("dl-r opid .Operator -> %s" % r[0])
+        if r[0] == "ok" and r[1] is not None:
+            op = r[1]
+            if isinstance(op, (int,)):
+                return op
+        return None
+
+    def _emit_coord_surface(self, coords):
+        """Emit the attribute surface of a telemetry coordinate object (only
+        used when _coord_to_ll/_merc_to_ll both failed). Read-only + emit only;
+        every probe is _try-guarded so this can never freeze the engine."""
+        try:
+            self.emit("dl-r coords type=%s" % type(coords).__name__)
+        except Exception:
+            pass
+        try:
+            self.emit("dl-r coords repr=%s" % _desc(coords, 90))
+        except Exception:
+            pass
+        try:
+            names = [m for m in dir(coords) if not m.startswith("_")][:24]
+            self.emit("dl-r coords dir=%s" % ",".join(names))
+        except Exception:
+            pass
+        for a, b in (("latitude", "longitude"), ("Latitude", "Longitude"),
+                     ("lat", "lon"), ("Lat", "Lon"), ("_lat", "_longt"),
+                     ("_Latitude", "_Longitude"), ("lagLat", "lagLon"),
+                     ("Position", "Position")):
+            for attr in (a, b):
+                r = _try(lambda attr=attr: getattr(coords, attr))
+                self.emit("dl-r coords .%s -> %s" % (attr, r[0]))
+
+    def _dl_report(self, report, player_ll, mfg, src_key=None):
+        """Reduce a blackboard report object to fields; returns a dict or None.
+        Read-only, _try-guarded. Every getter is emit-traced because deep
+        report field access has frozen the engine (2026-08-30); mfg is a
+        mutable flag set when field access errored (partial read)."""
+        out = {}
+        src = self._report_source_id(report)
+        if src is None and src_key is not None:
+            out["src"] = src_key
+        elif src is not None:
+            out["src"] = src
+        op = self._report_operator_id(report)
+        if op is not None:
+            out["op"] = op
+        for name, attr in (("domain", "Domain"), ("about", "About"),
+                           ("life", "LifeTime")):
+            self.emit("dl-r rep-get .%s" % attr)
+            r = _try(lambda attr=attr: getattr(report, attr))
+            self.emit("dl-r rep-get .%s -> %s" % (attr, r[0]))
+            if r[0] == "ok" and r[1] is not None:
+                v = r[1]
+                if isinstance(v, (int, float, bool)):
+                    out[name] = round(float(v), 2)
+                elif isinstance(v, str):
+                    out[name] = v
+                else:
+                    out[name] = _desc(v, 40)
+        self.emit("dl-r rep-get .Telemetry")
+        t = _try(lambda: getattr(report, "Telemetry"))
+        self.emit("dl-r rep-get .Telemetry -> %s" % t[0])
+        if t[0] == "ok" and t[1] is not None:
+            tel = t[1]
+            coords = None
+            self.emit("dl-r rep-get tel._Coordinates")
+            cr = _try(lambda: getattr(tel, "_Coordinates"))
+            self.emit("dl-r rep-get tel._Coordinates -> %s" % cr[0])
+            if cr[0] != "ok" or cr[1] is None:
+                self.emit("dl-r rep-get tel.Coordinates")
+                cr = _try(lambda: getattr(tel, "Coordinates"))
+                self.emit("dl-r rep-get tel.Coordinates -> %s" % cr[0])
+            if cr[0] == "ok":
+                coords = cr[1]
+            ll = None
+            if coords is not None:
+                ll = _coord_to_ll(coords)
+                if ll is None:
+                    ll = self._merc_to_ll(coords, force=True)
+                if ll is None:
+                    self._emit_coord_surface(coords)
+            if ll is not None:
+                out["lat"] = round(ll[0], 5)
+                out["lon"] = round(ll[1], 5)
+                if player_ll is not None:
+                    km, brg = _range_bearing(player_ll[0], player_ll[1],
+                                             ll[0], ll[1])
+                    if km is not None:
+                        out["player_km"] = km
+                        out["brg"] = brg
+                    else:
+                        mfg[0] = True
+            for name, attr in (("course", "_Course"), ("speed", "_Speed"),
+                               ("elev", "_Elevation"),
+                               ("validity", "_Validity")):
+                self.emit("dl-r rep-get tel.%s" % attr)
+                rr = _try(lambda attr=attr, tel=tel: getattr(tel, attr))
+                self.emit("dl-r rep-get tel.%s -> %s" % (attr, rr[0]))
+                if rr[0] == "ok" and rr[1] is not None:
+                    v = rr[1]
+                    if isinstance(v, (int, float, bool)):
+                        out[name] = round(float(v), 2)
+                    elif isinstance(v, str):
+                        out[name] = v
+                    else:
+                        out[name] = _desc(v, 20)
+                else:
+                    mfg[0] = True
+        else:
+            mfg[0] = True
+        return out or None
+
+    def _player_ll(self, source="host"):
+        """Resolve the player position for report filtering.
+
+        source="host"  -> this host's CoordinatesManager.Player navigation
+                          (works on host-scoped probes; may fail on the
+                          tactical_ai command-only host).
+        source="state" -> latest ship_state.json written by the full probe
+                          (shared log dir): navigation.lat_lon, falling back
+                          to player.navigation.lat_lon. Pure file read, zero
+                          C# calls - safe on every host.
+        Returns (lat_lon|None, source_label)."""
+        if source == "host":
+            try:
+                pnav = self.player_navigation()
+            except Exception:
+                pnav = None
+            if pnav is not None:
+                r = _try(lambda: pnav.INS.GeoCoordinates)
+                if r[0] == "ok":
+                    ll = _coord_to_ll(r[1])
+                    if ll is not None:
+                        return ll, "host"
+            return None, "host"
+        try:
+            with io.open(os.path.join(self.log_dir, _STATE_NAME),
+                         "r", encoding="utf-8") as f:
+                st = json.load(f)
+        except Exception:
+            return None, "state"
+        ll = None
+        nav = (st or {}).get("navigation") or {}
+        if isinstance(nav.get("lat_lon"), (list, tuple)) and len(nav.get("lat_lon")) >= 2:
+            ll = nav["lat_lon"]
+        else:
+            p = (st or {}).get("player") or {}
+            pnav = p.get("navigation") or {}
+            if isinstance(pnav.get("lat_lon"), (list, tuple)) and len(pnav.get("lat_lon")) >= 2:
+                ll = pnav["lat_lon"]
+        if ll is not None:
+            try:
+                lat, lon = float(ll[0]), float(ll[1])
+            except Exception:
+                lat = lon = None
+            if lat is not None and abs(lat) <= 90.0 and abs(lon) <= 360.0:
+                return (lat, lon), "state"
+        return None, "state"
+
+    def do_dl_reports(self, cmd):
+        """Diagnose the tactical-AI operator datalink reports (see above)."""
+        all_mode = str(cmd.get("all", "")).strip().lower() in ("1", "true", "yes")
+        try:
+            op_arg = int(cmd["op"])
+        except Exception:
+            op_arg = None
+        lines = ["dl-reports: %s (players-centre radius %.0f km)"
+                 % ("all reports" if all_mode else "player-centred reports",
+                    float(self.cfg.get("dl_player_km", 20.0)))]
+        player_ll = None
+        if not all_mode:
+            player_ll, src = self._player_ll("host")
+            if player_ll is None:
+                player_ll, src = self._player_ll("state")
+            if player_ll is None:
+                raise RuntimeError("no player position (host nav + %s both"
+                                   " unresolved)" % _STATE_NAME)
+            lines.append("dl-reports: player at lat=%.4f lon=%.4f via %s"
+                         % (player_ll[0], player_ll[1], src))
+        # find operator namespaces that carry a report blackboard
+        ops = []
+        for ns in self._ai_namespaces():
+            try:
+                nid = int(ns)
+            except Exception:
+                continue
+            if op_arg is not None and nid != op_arg:
+                continue
+            if op_arg is None and nid in ops:
+                continue
+            kv = self._element_namespace(nid)
+            if kv is not None and kv.get("last_reports") is not None:
+                ops.append(nid)
+            self.emit("dl-report candidate ns=%s kv=%s" % (ns, kv is not None))
+        if not ops:
+            self.emit("dl-reports: no operator blackboard found")
+            raise RuntimeError("no operator with last_reports on this host")
+        lines.append("dl-reports: operators=%s" % ",".join(str(o) for o in ops))
+        deep = str(cmd.get("deep", "")).strip().lower() in ("1", "true", "yes")
+        for op in sorted(ops):
+            self.emit("dl-r op %d begin" % op)
+            kv = self._element_namespace(op)
+            lines.append("== operator %d ==" % op)
+            self.emit("dl-r op %d ns kv=%d keys" % (op, len(kv) if kv else 0))
+            # CRASH-SAFE (2026-08-30): blackboard VALUES behind these keys are
+            # engine proxies; native coercion (float()/int()/len())) on them has
+            # frozen the game twice. Every interop below is emit-traced line -
+            # line so a freeze leaves the last traced step visible in the log.
+            for name, attr in (("country_id", "country_id"),
+                               ("ai_realism", "ai_realism"),
+                               ("validity", "validity"),
+                               ("cycles", "cycles"),
+                               ("count_agents", "count_agents"),
+                               ("count_all_agents", "count_all_agents")):
+                if kv.get(attr) is None:
+                    continue
+                r = _try(lambda attr=attr: kv.get(attr))
+                self.emit("dl-r meta %d.%s -> %s" % (op, attr, r[0]))
+                if r[0] != "ok":
+                    continue
+                v = r[1]
+                if isinstance(v, (bool, int)):
+                    lines.append("%s=%d" % (name, int(v)))
+                elif isinstance(v, float):
+                    lines.append("%s=%.3f" % (name, v))
+                elif isinstance(v, str) and v.strip():
+                    lines.append("%s=%s" % (name, v.strip()))
+                else:
+                    lines.append("%s=(opaque %s)" % (name, type(v).__name__))
+            self.emit("dl-r lr-get %d" % op)
+            lr_r = _try(lambda: kv.get("last_reports"))
+            self.emit("dl-r lr %d -> %s type=%s" % (op, lr_r[0],
+                     type(lr_r[1]).__name__ if lr_r[1] is not None else "None"))
+            if lr_r[0] != "ok":
+                continue
+            lr = lr_r[1]
+            if lr is None:
+                lines.append("  last_reports: none")
+                continue
+            if isinstance(lr, (dict, list, tuple, set)):
+                self.emit("dl-r lr %d native %s len=" % (op, type(lr).__name__))
+                n = len(lr)
+                self.emit("dl-r lr %d native len=%d" % (op, n))
+                lines.append("  last_reports entries=%d (deep read deferred - crash-safe default)"
+                             % n)
+                if deep:
+                    entries = list(lr.values()) if isinstance(lr, dict) else list(lr)
+                    src_keys = list(lr.keys()) if isinstance(lr, dict) else None
+                    all_reps = str(cmd.get("all_reps", "")).strip().lower() in ("1", "true", "yes")
+                    shown = 0
+                    for i, rep in enumerate(entries):
+                        if not all_reps and i > 0:
+                            lines.append("  (peeked first report only - pass all_reps:true for all)")
+                            break
+                        self.emit("dl-r rep %d i=%d" % (op, i))
+                        if rep is None:
+                            continue
+                        mfg = [False]
+                        sk = src_keys[i] if src_keys is not None and i < len(src_keys) else None
+                        row = self._dl_report(rep, player_ll, mfg, src_key=sk)
+                        self.emit("dl-r rep %d i=%d row=%s" % (op, i, "ok" if row else "none"))
+                        if row is None:
+                            lines.append("  report %d <unreadable>%s"
+                                         % (i, " (partial)" if mfg[0] else ""))
+                            continue
+                        row["partial"] = mfg[0]
+                        if all_mode or row.get("player_km") is not None:
+                            lines.append("  " + self._dl_report_line(row))
+                            shown += 1
+                    lines.append("  shown=%d (deep)" % shown)
+            else:
+                self.emit("dl-r lr %d opaque" % op)
+                lines.append("  last_reports container opaque (%s) - "
+                             "not iterated (crash-safe)" % type(lr).__name__)
+            if not deep:
+                continue
+            for key, label in (("initial_reports", "initial_reports"),
+                               ("theater", "theater fused"),
+                               ("active_agents", "active_agents"),
+                               ("assignments", "assignments"),
+                               ("aggregated_reports", "aggregated_reports")):
+                if kv.get(key) is None:
+                    continue
+                self.emit("dl-r extra %d.%s get" % (op, key))
+                r = _try(lambda key=key: kv.get(key))
+                self.emit("dl-r extra %d.%s -> %s" % (op, key, r[0]))
+                if r[0] == "ok" and r[1] is not None:
+                    v = r[1]
+                    if isinstance(v, (list, tuple, set, str)):
+                        try:
+                            n = len(v)
+                        except Exception:
+                            n = None
+                        lines.append("  %s=%s" % (label, n if n is not None
+                                                  else _desc(v, 40)))
+                    elif isinstance(v, dict):
+                        lines.append("  %s=dict(%d)" % (label, len(v)))
+                    else:
+                        lines.append("  %s=(opaque %s)" % (label, type(v).__name__))
+        self.emit("dl-reports done: %d lines" % len(lines))
+        return lines
+
+    def _dl_report_line(self, row):
+        parts = []
+        for key in ("src", "op"):
+            if key in row:
+                parts.append("%s=%s" % (key, row[key]))
+        for key in ("domain", "about", "life"):
+            if key in row:
+                parts.append("%s=%s" % (key, row[key]))
+        if "lat" in row:
+            parts.append("lat=%.5f lon=%.5f" % (row["lat"], row["lon"]))
+        if "player_km" in row:
+            parts.append("player=%.1fkm@%.0fdeg" % (row["player_km"],
+                                                    row.get("brg", 0.0)))
+        for key in ("course", "speed", "elev", "validity"):
+            if key in row:
+                parts.append("%s=%s" % (key, row[key]))
+        if row.get("partial"):
+            parts.append("(partial)")
+        return " ".join(parts)
 
     def do_ai_attack(self, cmd):
         lines = []

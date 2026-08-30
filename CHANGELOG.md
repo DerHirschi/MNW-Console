@@ -1,5 +1,39 @@
 # Changelog
 
+## v2.11 (2026-08-30) — dl-reports command: WGS84 + player-centred km/brg
+
+Sync ship_probe + cli-gui from `masto/MNW-Tool/`. Adds a new `dl-reports` element
+command that dumps tactical-AI operator blackboard reports with live WGS84 positions
+and player-centred range/bearing. `measure_perf` re-enabled in deploy config.
+
+### ship_probe.py
+
+- **`dl-reports` command** — new element action (`_ACTIONS` + `_ELEMENT_ACTIONS`) that
+  dumps the tactical-AI operator blackboard reports. Two modes: player-centred
+  (default, radius `dl_player_km` default 20 km from the player position) or all
+  reports (`--all`). Each report line carries live WGS84 lat/lon (resolved via the
+  native GeoCoordinates fields) plus computed `player_km`/`brg` from the player,
+  formatting as `player=14.2km@312deg`.
+- **disasm references cleaned** (5 occurrences).
+
+### ship_probe_config.json
+
+- **`dl-reports`** added to the deployed `allow_commands` whitelist.
+- **`measure_perf: true`** — performance/tick timing instrumentation re-enabled
+  (was disabled in the previous synced config).
+- `_comment` updated (measure_perf explanation).
+
+### cli-gui/ai_tactical.py
+
+- **REPORT line rendering** — parses the `dl-reports` detail rows (regex
+  `([\d.]+)km@(-?[\d.]+)deg`), extracts `player_km`/`brg`, and renders
+  `player=X.Xkm@NNN°` alongside each report line (range via `_range_str`, bearing via
+  `_brg`).
+
+### Tests
+
+- ship_probe: 257 green. cli-gui: 105 green.
+
 ## v2.10 (2026-08-29) — Multi-host ai_state merge, blackboard helo gate, TUI ghost fix
 
 Sync ship_probe + cli-gui from `masto/MNW-Tool/`. Command-only hosts (helo, submarine)

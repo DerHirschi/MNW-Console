@@ -155,7 +155,7 @@ class LogTest(unittest.TestCase):
 class ActionsTest(unittest.TestCase):
     def test_actions_tuple(self):
         self.assertEqual(ship_probe._Probe._ACTIONS,
-                         ("helm", "planes", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "sd-dump", "tanks", "env", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc", "ai-state"))
+                         ("helm", "planes", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "sd-dump", "tanks", "env", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc", "ai-state", "dl-reports"))
 
     def test_eot_names(self):
         self.assertEqual(ship_probe._EOT_NAMES,
