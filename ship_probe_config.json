@@ -37,6 +37,8 @@
     "dl-reports"
   ],
   "resolve_positions": false,
+  "detect_auto": true,
+  "detect_skip_last_contact": true,
   "state_every": 3,
   "collect_mode": "queue",
   "sections_per_tick": 1,

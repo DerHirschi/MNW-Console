@@ -80,6 +80,7 @@ ORDERS_FILE = "ship_orders.json"
 RESULTS_FILE = "ship_results.json"
 LOG_FILE = "ship_probe_log.txt"
 PRESENCE_FILE = "datalink_presence.json"
+CONFIG_FILE = "ship_probe_config.json"
 
 STYLES = ("red", "amber", "green", "cyan", "dim", "hdr", "white")
 
@@ -1563,7 +1564,7 @@ class Collector(object):
 
     def __init__(self, source, interval=5.0, read_only=False,
                  detect_interval=10.0, asg_ttl=60.0, ext_ttl=60.0,
-                 refresh_after=45.0, count=None):
+                 refresh_after=45.0, count=None, auto_detect=True):
         self.source = source
         self.interval = interval
         self.read_only = read_only
@@ -1572,6 +1573,9 @@ class Collector(object):
         self.ext_ttl = ext_ttl
         self.refresh_after = refresh_after
         self.count = count
+        self.auto_detect = bool(auto_detect)
+        self._config_detect_auto = None
+        self._config_checked = False
         self.cycle = 0
         self.pending = {}
         self.pending_ts = {}           # cid -> queue time (stagnation watch)
@@ -1792,6 +1796,23 @@ class Collector(object):
         self._dl_prev_det = det_now
         self._dl_prev_ns = dict(self.ns_styles)
 
+    def _auto_detect_enabled(self):
+        """Auto-detected-scan gate: CLI auto_detect AND the probe-side config
+        key detect_auto (default true). One config switch on the probe side
+        therefore disables the periodic scan cluster-wide (crash escape hatch
+        for fragile missions); manual 'd' still sends the command (the probe
+        answers with a disabled-scan hint)."""
+        if not self.auto_detect:
+            return False
+        if not self._config_checked:
+            self._config_checked = True
+            try:
+                cfg = read_json_text(self.source.read_text(CONFIG_FILE)) or {}
+                self._config_detect_auto = bool(cfg.get("detect_auto", True))
+            except Exception:
+                self._config_detect_auto = True
+        return self._config_detect_auto is not False
+
     def _queue_commands(self, data):
         cmds = []
         # stagnation watchdog: pendings older than 45 s mean the probe never
@@ -1829,9 +1850,11 @@ class Collector(object):
             cmds.append({"action": "ns-dump"})
             self._last_nsdump_cycle = self.cycle
         # detected scan: base cadence (>= 10 s) plus event trigger whenever
-        # any element's signature changed (range/heading/assignment/...)
-        due = self._detect_due or \
-            (data["now"] - self._last_detect_ts) >= self.detect_interval
+        # any element's signature changed (range/heading/assignment/...) —
+        # but only when auto-detect is enabled (CLI flag + probe config)
+        due = (self._detect_due or
+               (data["now"] - self._last_detect_ts) >= self.detect_interval) \
+            and self._auto_detect_enabled()
         has_detect = any(v == "detect" for v in self.pending.values())
         if due and not has_detect:
             cmds.append({"action": "detected"})
@@ -2416,6 +2439,9 @@ def main(argv=None):
     ap.add_argument("--detect-interval", type=float, default=10.0,
                     help="detected scan base cadence in seconds (min 10; also "
                          "fires early when an element's state changes)")
+    ap.add_argument("--no-auto-detect", action="store_true",
+                    help="disable the periodic detected scan (keep manual d; "
+                         "escape hatch for missions that crash on the scan)")
     ap.add_argument("--asg-ttl", type=float, default=60.0, help="re-query asg after N seconds")
     args = ap.parse_args(argv)
 
@@ -2425,7 +2451,7 @@ def main(argv=None):
         source = LocalSource(args.log_dir or os.getcwd())
     collector = Collector(source, interval=args.interval, read_only=args.read_only,
                           detect_interval=args.detect_interval, asg_ttl=args.asg_ttl,
-                          count=args.count)
+                          count=args.count, auto_detect=not args.no_auto_detect)
     if args.json:
         def _dump(frame):
             return {"source": source.label(), "frame": frame,

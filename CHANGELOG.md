@@ -1,5 +1,41 @@
 # Changelog
 
+## v2.13 (2026-08-30) — detected native-crash guard + --no-auto-detect
+
+Sync ship_probe + cli-gui from `masto/MNW-Tool/`. Hardens the `detected`
+scan against a native ContactManager.GetTrack crash (uncatchable by `_try`) and
+adds a probe-side `detect_auto` kill-switch plus a TUI `--no-auto-detect` flag.
+
+### ship_probe.py
+
+- **`detect_skip_last_contact` (default true)** — the `detected` scan never hands
+  the last (newest/most volatile) `GetUsed` contact id to `ContactManager.GetTrack`.
+  That call has natively crashed the engine twice (log ends `ai-attack trk: GetTrack
+  cid=3`, gc.log `SuspendThread loop failed`); a native AV is not catchable by `_try`,
+  so the id is skipped within a proven-safe range. Emits a `native-guard: skip last
+  contact` diagnostic line.
+- **`detect_auto` (default true)** — config kill-switch for the auto `detected` scan;
+  when false the scan returns a `auto-scan disabled by config` line instead
+  (use `ai-contacts`/`ai-attack` instead). Stays true by default (user requirement).
+- **GetTrack diag lines** — `ai-attack trk: GetTrack cid=%s` + result lines retained
+  for crash localization.
+- **disasm references cleaned** (5 occurrences).
+
+### ship_probe_config.json
+
+- New keys: `detect_auto` (true), `detect_skip_last_contact` (true).
+
+### cli-gui/ai_tactical.py
+
+- **`--no-auto-detect` CLI flag + `auto_detect`** — disables the periodic `detected`
+  scan in the TUI (manual `d` key still works). `_auto_detect_enabled()` gates on both
+  the CLI flag AND the probe-side `detect_auto` config key.
+- **detect_interval due check** — now only fires when auto-detect is enabled.
+
+### Tests
+
+- ship_probe: 257 green. cli-gui: 105 green.
+
 ## v2.12 (2026-08-30) — cli-gui: dl-reports full parse + reference player pos
 
 Sync cli-gui from `masto/MNW-Tool/`. Enhances the `dl-reports` TUI parse/render to

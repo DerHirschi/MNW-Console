@@ -83,6 +83,15 @@ _DEFAULTS = {
     "element_action_grace_s": 5.0,
     "allow_commands": ["helm", "planes", "sd-dump", "tanks", "env", "plot", "clear-plot", "report", "probe", "ai-attack", "detected", "wc-dump", "steer", "ns-dump", "asg", "ai-contacts", "alarm", "sonctl", "tracker", "masts", "explore", "tracker-new", "dc", "ai-state", "dl-reports"],
     "resolve_positions": False,
+    "detect_auto": True,
+    # Native-crash guard (2026-08-30, 2nd crash): ContactManager.GetTrack(cid)
+    # with the LAST id returned by GetUsed segfaults the engine on some
+    # missions (log ends 'ai-attack trk: GetTrack cid=3', gc.log
+    # 'SuspendThread loop failed'). _try cannot catch a native AV, so the
+    # detected-scan skips the last (newest/most volatile) contact id per
+    # element. Singletons are still scanned (their single id is on the
+    # proven-safe range). detect_auto stays true (user requirement).
+    "detect_skip_last_contact": True,
     "state_every": 3,
     "collect_mode": "queue",
     "sections_per_tick": 1,
@@ -6025,7 +6034,9 @@ class _Probe(object):
         contacts (give_orders.py feeds Engage from opfor_report.Telemetry), so
         an attack on a player the AI does not track is a blind fire at a
         coordinate. Returns (found, detail_lines).
-        Every access is _try-guarded; read_sonar stays disabled."""
+        Every access is _try-guarded; read_sonar stays disabled.
+        Native-crash guard (detect_skip_last_contact): the last GetUsed id is
+        never handed to GetTrack (native AV, uncatchable by _try)."""
         out = {"checked": 0, "found": False, "err": None}
         cmgr = kv.get("_ContactManager")
         if cmgr is None:
@@ -6037,6 +6048,18 @@ class _Probe(object):
         used = r[1]
         if not used or len(used) == 0:
             return out, ["track probe: element %d has NO contacts in _ContactManager" % nid]
+
+        # Native-crash guard (detect_skip_last_contact): GetTrack on the last
+        # GetUsed id has natively crashed the engine twice (gc.log
+        # 'SuspendThread loop failed'; log ended 'GetTrack cid=3'). A native
+        # AV cannot be caught by _try, so we never call GetTrack with that id.
+        # Single-contact elements keep scanning their only id (proven-safe).
+        scan = list(used)
+        if self.cfg.get("detect_skip_last_contact", True) and len(scan) > 1:
+            skip_id = _desc(scan[-1], 40)
+            scan = scan[:-1]
+            self.emit("ai-attack trk: native-guard: skip last contact id=%s"
+                      " (detect_skip_last_contact)" % skip_id)
 
         nav = kv.get("_Navigation")
         own_ll = None
@@ -6052,18 +6075,35 @@ class _Probe(object):
         out["ai_player_km"] = ai_player_km
         self.emit("ai-attack cpa: %d contacts, ai->player %s km" % (len(used), ai_player_km))
         limit = int(self.cfg.get("max_contacts", 50))
-        for cid in used:
+        for cid in scan:
             if out["checked"] >= limit:
                 break
             out["checked"] += 1
+            self.emit("ai-attack trk: checked=%d of %d cid=%s"
+                      % (out["checked"], len(scan), _desc(cid, 40)))
+            self.emit("ai-attack trk: GetTrack cid=%s" % _desc(cid, 40))
             r = _try(lambda cid=cid: cmgr.GetTrack(cid))
+            self.emit("ai-attack trk: GetTrack -> %s" % r[0])
             if r[0] != "ok":
                 continue
             tk = r[1]
-            rng = _try(lambda: float(tk._Range))
-            if rng[0] != "ok":
+            self.emit("ai-attack trk: _Range get")
+            rg = _try(lambda: getattr(tk, "_Range"))
+            self.emit("ai-attack trk: _Range -> %s type=%s"
+                      % (rg[0], type(rg[1]).__name__ if rg[1] is not None
+                         else "None"))
+            # CRASH-SAFE (2026-08-30 hard freeze/crash on another mission):
+            # float() coercion of a blackboard proxy has crashed the engine.
+            # Only coerce already-native numbers; treat exotic ranges as
+            # "no useful read" and skip the contact instead of coercing.
+            rng_m = None
+            if rg[0] == "ok" and isinstance(rg[1], (int, float, bool)):
+                try:
+                    rng_m = float(rg[1])
+                except Exception:
+                    rng_m = None
+            if rng_m is None:
                 continue
-            rng_m = rng[1]
             if ai_player_km is not None and rng_m is not None:
                 diff_km = abs(rng_m / 1000.0 - ai_player_km)
                 if diff_km <= 3.0:
@@ -6075,7 +6115,7 @@ class _Probe(object):
                     self.emit("ai-attack cpb: player tracked (range %.0f m)" % rng_m)
                     return out, lines
         lines.append("track probe: NO contact on player (checked %d of %d contacts)"
-                     % (out["checked"], len(used)))
+                     % (out["checked"], len(scan)))
         self.emit("ai-attack cpc: player NOT tracked")
         return out, lines
 
@@ -6089,6 +6129,10 @@ class _Probe(object):
 
         Returns a detail line per AI element that tracks the player plus a
         summary line 'DETECTED' or 'NOT detected by any AI element'."""
+        if not self.cfg.get("detect_auto", True):
+            self.emit("detected: auto-scan disabled (detect_auto=false)")
+            return ["detected: auto-scan disabled by config"
+                    " (detect_auto=false) — use ai-contacts/ai-attack instead"]
         lines = ["detected: scanning %s" % _desc(self._ai_namespaces(), 80)]
         _t_det0 = time.monotonic()
         player_ll = None
